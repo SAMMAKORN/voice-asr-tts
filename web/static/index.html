@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>VOICE LINK · คุยกับ AI ด้วยเสียง</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🛰️</text></svg>">
+</head>
+<body>
+<div class="backdrop"></div>
+
+<div class="shell">
+
+  <!-- ============ แถบหัว ============ -->
+  <header class="hud">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+          <path d="M12 3v10"/><path d="M8 6v4"/><path d="M16 6v4"/>
+          <path d="M5 12a7 7 0 0 0 14 0"/><path d="M12 19v2"/>
+        </svg>
+      </span>
+      <div>
+        <h1>Voice&nbsp;Link</h1>
+        <p>เสียง → ถอดเสียง → คิด → พูดกลับ · พูดแทรกได้ตลอดเวลา</p>
+      </div>
+    </div>
+
+    <div class="chips" id="chips">
+      <span class="chip"><span class="k">LLM</span> <b id="chip-llm">—</b></span>
+      <span class="chip"><span class="k">ASR</span> <b id="chip-asr">—</b></span>
+      <span class="chip"><span class="k">TTS</span> <b id="chip-tts">—</b></span>
+    </div>
+
+    <span class="link-state" id="link" data-on=""><i class="dot"></i><span id="link-text">ยังไม่เชื่อมต่อ</span></span>
+  </header>
+
+  <!-- ============ กลางจอ ============ -->
+  <div class="main">
+
+    <section class="panel">
+      <div class="panel-head">
+        <span>บทสนทนา</span>
+        <span class="spacer"></span>
+        <span id="turn-count">0 ข้อความ</span>
+      </div>
+      <div class="stream" id="stream">
+        <div class="empty" id="empty">
+          <span class="ring" aria-hidden="true">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+              <rect x="9" y="2" width="6" height="11" rx="3"/>
+              <path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v4"/>
+            </svg>
+          </span>
+          <div>ยังไม่มีบทสนทนา<br><small>กด “เริ่มระบบ” แล้วพูดได้เลย</small></div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="side">
+      <div class="panel meter-box">
+        <div class="meter-label"><span>ระดับเสียงเข้า</span><span id="meter-val">—</span></div>
+        <div class="meter" id="meter">
+          <div class="fill" id="meter-fill"></div>
+          <div class="mark" id="meter-mark" style="inset-inline-start:40%"></div>
+        </div>
+        <canvas class="wave" id="wave" width="480" height="108" aria-hidden="true"></canvas>
+        <div class="stats">
+          <div class="stat"><div class="k">ถอดเสียง</div><div class="v" id="stat-asr">—</div></div>
+          <div class="stat"><div class="k">token แรก</div><div class="v" id="stat-llm">—</div></div>
+          <div class="stat"><div class="k">เสียงตอบ</div><div class="v" id="stat-tts">—</div></div>
+          <div class="stat"><div class="k">พูดแทรก</div><div class="v" id="stat-int">0</div></div>
+        </div>
+      </div>
+
+      <div class="panel" style="min-height:0">
+        <div class="panel-head"><span>บันทึกระบบ</span></div>
+        <div class="logs" id="logs"></div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- ============ แถบควบคุม ============ -->
+  <footer class="dock">
+    <div class="orb" id="orb" data-state="idle" aria-hidden="true">
+      <svg class="ring" viewBox="0 0 80 80">
+        <circle class="track" cx="40" cy="40" r="36"/>
+        <circle class="val" id="orb-val" cx="40" cy="40" r="36"
+                stroke-dasharray="226.2" stroke-dashoffset="226.2"/>
+      </svg>
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+        <rect x="9" y="2" width="6" height="11" rx="3"/>
+        <path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v4"/>
+      </svg>
+    </div>
+
+    <div class="status-text">
+      <div class="now" id="status-now">กด “เริ่มระบบ” เพื่อเปิดไมโครโฟน</div>
+      <div class="hint" id="status-hint">ครั้งแรกเบราว์เซอร์จะถามสิทธิ์ไมค์ — กดอนุญาต</div>
+    </div>
+
+    <div class="controls">
+      <button class="btn primary" id="btn-start">เริ่มระบบ</button>
+      <button class="btn danger" id="btn-stop" disabled title="หยุด AI ที่กำลังพูด">■ หยุด</button>
+      <button class="btn" id="btn-mute" data-on="0" disabled title="ปิด/เปิดเสียงพูดของ AI">🔊 เสียง</button>
+      <button class="btn" id="btn-echo" data-on="0" disabled title="เปิดเมื่อใช้ลำโพงดังแล้วไมค์ได้ยินเสียง AI ตัวเอง">🎧 หูฟัง</button>
+      <button class="btn" id="btn-clear" disabled title="ล้างประวัติการสนทนา">🧹 ล้าง</button>
+      <button class="btn ghost" id="btn-help" title="เปิดคู่มือการใช้งาน">? วิธีใช้</button>
+    </div>
+
+    <form class="compose" id="compose">
+      <input id="input" type="text" autocomplete="off" placeholder="พิมพ์แทนการพูดก็ได้ แล้วกด Enter" disabled>
+      <button class="btn" type="submit" id="btn-send" disabled>ส่ง</button>
+    </form>
+  </footer>
+</div>
+
+<!-- ============ Onboarding ============ -->
+<div class="overlay" id="overlay">
+  <div class="tour" role="dialog" aria-modal="true" aria-labelledby="tour-title">
+    <div class="tour-head">
+      <span>คู่มือเริ่มต้น</span>
+      <span class="steps" id="tour-steps"></span>
+    </div>
+
+    <div class="tour-body" id="tour-body">
+
+      <!-- ---- 1 ---- -->
+      <section data-step="0">
+        <h2 id="tour-title">ระบบคุยกับ AI ด้วยเสียง</h2>
+        <p class="lead">พูดใส่ไมค์ แล้ว AI ตอบกลับเป็นเสียงทันที — ไม่ต้องกดปุ่มพูด ไม่ต้องรอคิว</p>
+
+        <div class="flow">
+          <div class="node">MIC<small>ไมค์คุณ</small></div>
+          <span class="arrow">›</span>
+          <div class="node">ASR<small>ถอดเสียง</small></div>
+          <span class="arrow">›</span>
+          <div class="node">LLM<small>คิดคำตอบ</small></div>
+          <span class="arrow">›</span>
+          <div class="node">TTS<small>สร้างเสียง</small></div>
+          <span class="arrow">›</span>
+          <div class="node">SPK<small>ลำโพง</small></div>
+          <div class="back">↺ ไมค์เปิดอยู่ตลอด — พูดแทรกได้แม้ AI กำลังพูด</div>
+        </div>
+
+        <p>คู่มือนี้มี 5 ขั้น ใช้เวลาไม่ถึงหนึ่งนาที จะพาตั้งค่าไมค์ ตรวจว่าระบบต่อ AI ได้จริง
+           แล้วสอนวิธีคุยให้ลื่นที่สุด</p>
+      </section>
+
+      <!-- ---- 2 ---- -->
+      <section data-step="1" hidden>
+        <h2>ขั้นที่ 1 · เปิดไมโครโฟน</h2>
+        <p class="lead">กดปุ่มข้างล่าง เบราว์เซอร์จะถามสิทธิ์ไมค์ — เลือก “อนุญาต”</p>
+
+        <div class="mic-test">
+          <div class="cap"><span>ทดสอบระดับเสียง</span><span id="mic-state">ยังไม่เปิด</span></div>
+          <div class="meter"><div class="fill" id="mic-fill"></div></div>
+          <p style="margin:11px 0 0;font-size:12.5px;color:var(--faint)">
+            ลองพูดดู แถบควรขยับตามเสียง ถ้านิ่งสนิทให้เช็กว่าเลือกไมค์ถูกตัวใน System&nbsp;Settings
+          </p>
+        </div>
+
+        <button class="btn primary" id="btn-mic">อนุญาตไมโครโฟน</button>
+        <p style="margin-top:14px;font-size:12.5px;color:var(--faint)">
+          เบราว์เซอร์เปิดระบบตัดเสียงสะท้อน (AEC) ให้อัตโนมัติ จึงใช้ลำโพงได้เลย
+          แต่ถ้าใส่หูฟังจะพูดแทรกได้ไวและแม่นกว่า
+        </p>
+      </section>
+
+      <!-- ---- 3 ---- -->
+      <section data-step="2" hidden>
+        <h2>ขั้นที่ 2 · ตรวจว่าต่อ AI ได้จริง</h2>
+        <p class="lead">ยิงทดสอบครบวง สร้างเสียง → ถอดเสียง → ให้โมเดลตอบ โดยยังไม่ใช้ไมค์</p>
+
+        <div class="check" id="check"></div>
+        <button class="btn primary" id="btn-check">เริ่มตรวจระบบ</button>
+        <p style="margin-top:14px;font-size:12.5px;color:var(--faint)">
+          ขั้นนี้ข้ามได้ แต่ถ้ามีอะไรพัง จะได้รู้ตั้งแต่ตอนนี้แทนที่จะไปงงตอนคุย
+        </p>
+      </section>
+
+      <!-- ---- 4 ---- -->
+      <section data-step="3" hidden>
+        <h2>ขั้นที่ 3 · วิธีคุย</h2>
+        <p class="lead">ไม่มีปุ่มกดพูด — แค่พูดออกมาเฉย ๆ</p>
+        <ul>
+          <li>เริ่มระบบแล้ว AI จะ<b>ทักทายก่อน</b> พอมันพูดจบก็พูดตอบได้ทันที</li>
+          <li>ระบบรู้เองว่า<b>คุณพูดจบแล้ว</b> เมื่อเงียบไปราวครึ่งวินาที แล้วจะเริ่มถอดเสียงทันที</li>
+          <li>เสียงที่คุณพูดกับคำตอบของ AI จะ<b>ขึ้นเป็นข้อความ</b>บนหน้าจอไปพร้อมกัน</li>
+          <li>อยู่ในที่ห้ามส่งเสียง? <b>พิมพ์ในช่องล่าง</b>แล้วกด <kbd>Enter</kbd> ได้เหมือนกัน</li>
+        </ul>
+        <div class="note">
+          <b>เคล็ดลับ</b> — พูดเป็นประโยคปกติ ไม่ต้องพูดช้าหรือเว้นวรรคทีละคำ
+          ระบบตั้งมาให้จับจังหวะการพูดแบบธรรมชาติ
+        </div>
+      </section>
+
+      <!-- ---- 5 ---- -->
+      <section data-step="4" hidden>
+        <h2>ขั้นที่ 4 · พูดแทรก และปุ่มต่าง ๆ</h2>
+        <p class="lead">AI พูดยาวไป? พูดขัดได้เลย มันจะหยุดกลางประโยคทันที</p>
+        <ul>
+          <li>ระหว่าง AI พูด ถ้าคุณเริ่มพูด ระบบจะ<b>ตัดเสียงทิ้งทันที</b>แล้วหันมาฟังคุณ</li>
+          <li>AI จะจำว่า<b>พูดค้างไว้แค่ไหน</b> จึงไม่พูดซ้ำท่อนที่คุณยังไม่ได้ยิน</li>
+          <li>ปุ่ม <b>■ หยุด</b> สั่งหยุดด้วยมือ · <b>🔊 เสียง</b> ปิดเสียงเหลือแต่ข้อความ</li>
+          <li>ปุ่ม <b>🎧 หูฟัง</b> เปิดเมื่อใช้<b>ลำโพงดัง</b>แล้วไมค์เผลอได้ยินเสียง AI เอง</li>
+          <li>ปุ่ม <b>🧹 ล้าง</b> ล้างความจำการสนทนา เริ่มเรื่องใหม่</li>
+        </ul>
+        <div class="note">
+          ทุกบทสนทนาถูก<b>บันทึกลงเครื่อง</b>ในโฟลเดอร์ <code>logs/</code> ทั้งข้อความและเวลาตอบสนองแต่ละขั้น
+          เปิดย้อนดูภายหลังได้
+        </div>
+      </section>
+    </div>
+
+    <div class="tour-foot">
+      <button class="btn ghost" id="tour-skip">ข้ามคู่มือ</button>
+      <span class="spacer"></span>
+      <button class="btn" id="tour-prev" disabled>ย้อนกลับ</button>
+      <button class="btn primary" id="tour-next">ถัดไป</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

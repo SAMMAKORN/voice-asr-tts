@@ -1,0 +1,12 @@
+httpx>=0.27
+numpy>=1.26
+python-dotenv>=1.0
+sounddevice>=0.4.6
+
+# --- เฉพาะโหมดเว็บ (web/server.py) ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# --- เฉพาะตอนทดสอบด้วยเบราว์เซอร์จริง (tests/test_browser.py) ---
+# ติดตั้งเพิ่มเองเมื่อต้องใช้:
+#   pip install playwright && python3 -m playwright install chromium

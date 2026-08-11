@@ -1,0 +1,9 @@
+.env
+logs/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+
+# ไฟล์เสียงที่เทสสร้างขึ้น
+tests/_fakemic/
