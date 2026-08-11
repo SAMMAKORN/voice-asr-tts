@@ -5,6 +5,7 @@
 
 const $ = (id) => document.getElementById(id);
 const TOUR_KEY = 'voicelink.tour.v1';
+const THEME_KEY = 'voicelink.theme.v1';
 
 let CFG = { mic_sr: 16000, speaker_sr: 24000, frame_ms: 20 };
 
@@ -60,6 +61,45 @@ function controls(on) {
   for (const id of ['btn-stop', 'btn-mute', 'btn-echo', 'btn-clear', 'input', 'btn-send']) {
     $(id).disabled = !on;
   }
+}
+
+// ───────────────────────────────────────────────────────── ธีมหน้าจอ
+/* ธีมถูก apply ไปแล้วโดย inline script ใน <head> (กันหน้าจอกระพริบ)
+   ที่นี่ดูแลแค่ปุ่มสลับ, การจำค่าที่เลือก และการตามธีมของระบบ */
+const THEMES = {
+  hud:  { icon: '🛰️', name: 'HUD' },
+  clay: { icon: '🧸', name: 'ดินน้ำมัน' },
+};
+
+const isTheme = (name) => Object.prototype.hasOwnProperty.call(THEMES, name);
+
+function currentTheme() {
+  return document.documentElement.dataset.theme === 'clay' ? 'clay' : 'hud';
+}
+
+/* ยังไม่มีค่าใน localStorage = ผู้ใช้ยังไม่เคยเลือกเอง → ให้ตามระบบไปก่อน */
+function themeChosenByUser() {
+  try { return isTheme(localStorage.getItem(THEME_KEY)); } catch (_) { return false; }
+}
+
+function syncThemeButton() {
+  const t = THEMES[currentTheme()];
+  const icon = $('theme-icon'), name = $('theme-name');
+  if (icon) icon.textContent = t.icon;
+  if (name) name.textContent = t.name;
+  const btn = $('btn-theme');
+  if (btn) btn.title = `ธีมปัจจุบัน: ${t.name} — กดเพื่อสลับ`;
+}
+
+function applyTheme(name, persist) {
+  const key = isTheme(name) ? name : 'hud';
+  document.documentElement.dataset.theme = key;
+  syncThemeButton();
+  if (persist !== false) {
+    try { localStorage.setItem(THEME_KEY, key); } catch (_) { /* localStorage ถูกปิด */ }
+  }
+  refreshWaveColors();               // สีเส้นคลื่นเปลี่ยนตามธีม
+  addLog(`เปลี่ยนธีมเป็น ${THEMES[key].icon} ${THEMES[key].name}`);
 }
 
 // ───────────────────────────────────────────────────────── บทสนทนา
@@ -148,6 +188,18 @@ function showSources(items) {
 // ───────────────────────────────────────────────────────── มิเตอร์ + คลื่นเสียง
 const scale = (v) => Math.max(0, Math.min(1, Math.sqrt(v / 0.35)));
 
+/* สีเส้นคลื่นมาจาก token ของธีม — cache ไว้เพราะ getComputedStyle บังคับให้
+   เบราว์เซอร์คำนวณ style ใหม่ ถ้าเรียกทุกเฟรมก็คือ 60 ครั้ง/วินาที */
+const WAVE = { line: '#5eeaff', axis: 'rgba(94,234,255,.12)' };
+
+function refreshWaveColors() {
+  const cs = getComputedStyle(document.documentElement);
+  const line = cs.getPropertyValue('--wave-line').trim();
+  const axis = cs.getPropertyValue('--wave-axis').trim();
+  if (line) WAVE.line = line;
+  if (axis) WAVE.axis = axis;
+}
+
 function drawWave() {
   const cv = $('wave');
   const g = cv.getContext('2d');
@@ -159,13 +211,14 @@ function drawWave() {
     const w = cv.width, h = cv.height;
     g.clearRect(0, 0, w, h);
 
-    g.strokeStyle = 'rgba(94,234,255,.12)';
+    g.strokeStyle = WAVE.axis;
     g.lineWidth = 1;
     g.beginPath(); g.moveTo(0, h / 2); g.lineTo(w, h / 2); g.stroke();
 
     if (!buf || !A.micAn) return;
     A.micAn.getFloatTimeDomainData(buf);
-    g.strokeStyle = live ? '#5eeaff' : 'rgba(94,234,255,.3)';
+    g.strokeStyle = WAVE.line;
+    g.globalAlpha = live ? 1 : 0.3;      // ยังไม่เริ่มสตรีม → เส้นจาง ๆ
     g.lineWidth = 1.6;
     g.beginPath();
     for (let i = 0; i < n; i++) {
@@ -174,6 +227,7 @@ function drawWave() {
       i ? g.lineTo(x, y) : g.moveTo(x, y);
     }
     g.stroke();
+    g.globalAlpha = 1;
   })();
 }
 
@@ -485,6 +539,11 @@ $('btn-echo').addEventListener('click', (e) => {
 $('btn-clear').addEventListener('click', () => send({ type: 'clear' }));
 $('btn-help').addEventListener('click', () => openTour(0));
 
+// กดเองแล้วถือว่า “เลือกเอง” — จำค่าไว้และเลิกตามธีมของระบบ
+$('btn-theme').addEventListener('click', () => {
+  applyTheme(currentTheme() === 'hud' ? 'clay' : 'hud');
+});
+
 $('compose').addEventListener('submit', (e) => {
   e.preventDefault();
   const el = $('input');
@@ -606,6 +665,20 @@ function row(icon, name, detail, ms, ok, model) {
 
 // ───────────────────────────────────────────────────────── เริ่มต้นหน้า
 (async function init() {
+  // ธีมถูกเซ็ตจาก inline script ใน <head> แล้ว — ตรงนี้แค่ทำให้ป้ายบนปุ่มตรงกัน
+  // (ห้ามเรียก applyTheme ตอนเริ่ม ไม่งั้นค่าที่ผู้ใช้เลือกไว้จะถูกเขียนทับ)
+  syncThemeButton();
+  refreshWaveColors();               // drawWave ถูกเรียกทีหลัง จึงต้องมีสีไว้ก่อน
+
+  // ยังไม่เคยเลือกเอง → เปลี่ยนตามธีมของระบบ (ไม่บันทึกลง localStorage)
+  const mq = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)');
+  if (mq && mq.addEventListener) {
+    mq.addEventListener('change', (e) => {
+      if (themeChosenByUser()) return;
+      applyTheme(e.matches ? 'clay' : 'hud', false);
+    });
+  }
+
   try {
     const res = await fetch('/api/config');
     const data = await res.json();

@@ -3,8 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="dark light">
 <title>VOICE LINK · คุยกับ AI ด้วยเสียง</title>
+<script>
+/* เลือกธีมก่อน paint แรก — ไม่ให้หน้าจอกระพริบธีมผิดตอนโหลด
+   ค่าที่ผู้ใช้เคยเลือกมาก่อนสำคัญกว่าค่าของระบบ */
+(function () {
+  var t = null;
+  try { t = localStorage.getItem('voicelink.theme.v1'); } catch (_) { /* localStorage ถูกปิด */ }
+  if (t !== 'hud' && t !== 'clay') {
+    var light = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+    t = light ? 'clay' : 'hud';
+  }
+  document.documentElement.dataset.theme = t;
+})();
+</script>
 <link rel="stylesheet" href="/static/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🛰️</text></svg>">
 </head>
@@ -33,6 +46,10 @@
       <span class="chip"><span class="k">ASR</span> <b id="chip-asr">—</b></span>
       <span class="chip"><span class="k">TTS</span> <b id="chip-tts">—</b></span>
     </div>
+
+    <button class="btn ghost" id="btn-theme" title="สลับธีมหน้าจอ" aria-label="สลับธีมหน้าจอ">
+      <span id="theme-icon">🛰️</span> <span id="theme-name">HUD</span>
+    </button>
 
     <span class="link-state" id="link" data-on=""><i class="dot"></i><span id="link-text">ยังไม่เชื่อมต่อ</span></span>
   </header>
@@ -207,6 +224,7 @@
           <li>ปุ่ม <b>■ หยุด</b> สั่งหยุดด้วยมือ · <b>🔊 เสียง</b> ปิดเสียงเหลือแต่ข้อความ</li>
           <li>ปุ่ม <b>🎧 หูฟัง</b> เปิดเมื่อใช้<b>ลำโพงดัง</b>แล้วไมค์เผลอได้ยินเสียง AI เอง</li>
           <li>ปุ่ม <b>🧹 ล้าง</b> ล้างความจำการสนทนา เริ่มเรื่องใหม่</li>
+          <li>ปุ่มธีมมุมขวาบนสลับหน้าตาได้สองแบบ — <b>🛰️ HUD</b> โทนมืด กับ <b>🧸 ดินน้ำมัน</b> โทนสว่าง ระบบจำที่เลือกไว้ให้</li>
         </ul>
         <div class="note">
           ทุกบทสนทนาถูก<b>บันทึกลงเครื่อง</b>ในโฟลเดอร์ <code>logs/</code> ทั้งข้อความและเวลาตอบสนองแต่ละขั้น
