@@ -11,10 +11,12 @@ import stat
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pytest
 
+from vc.config import now as tz_now
 from vc.logger import (DIR_MODE, FILE_MODE, SessionLogger, purge_old_sessions,
                        session_started_at)
 
@@ -87,7 +89,7 @@ def test_existing_wide_open_dir_is_tightened(tmp_path) -> None:
 
 # ─────────────────────────────────────────── LOG_RETENTION_DAYS (AC-18.2/18.6)
 def make_session_dir(root: Path, age_days: int) -> Path:
-    stamp = (datetime.now() - timedelta(days=age_days)).strftime("%Y%m%d-%H%M%S")
+    stamp = (tz_now() - timedelta(days=age_days)).strftime("%Y%m%d-%H%M%S")
     path = root / f"session-{stamp}"
     path.mkdir(parents=True)
     (path / "transcript.md").write_text("เก่า", encoding="utf-8")
@@ -137,8 +139,10 @@ def test_logger_purges_on_startup_and_records_it(tmp_path) -> None:
 
 
 def test_session_stamp_round_trip() -> None:
-    assert session_started_at(Path("session-20250101-101530")) == \
-        datetime(2025, 1, 1, 10, 15, 30)
+    """ชื่อโฟลเดอร์ไม่เก็บ tz ไว้ → ตีความในโซนที่ระบบใช้ แล้วติด tzinfo ให้ (P3-20)"""
+    got = session_started_at(Path("session-20250101-101530"))
+    assert got == datetime(2025, 1, 1, 10, 15, 30, tzinfo=ZoneInfo("Asia/Bangkok"))
+    assert got.tzinfo is not None, "ต้องมี tzinfo ไม่งั้นเทียบกับ now() ไม่ได้"
     assert session_started_at(Path("อื่น ๆ")) is None
 
 

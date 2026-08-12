@@ -14,10 +14,12 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
 from .api import pcm16_to_wav
+from .config import DEFAULT_TZ, now, zone
 
 DIR_MODE = 0o700         # drwx------
 FILE_MODE = 0o600        # -rw-------
@@ -55,18 +57,24 @@ def private_file(path: Path) -> Path:
     return path
 
 
-def session_started_at(path: Path) -> datetime | None:
-    """อ่านเวลาเริ่มจากชื่อโฟลเดอร์ `session-YYYYmmdd-HHMMSS`"""
+def session_started_at(path: Path,
+                       tz: str | ZoneInfo | None = None) -> datetime | None:
+    """อ่านเวลาเริ่มจากชื่อโฟลเดอร์ `session-YYYYmmdd-HHMMSS`
+
+    ชื่อโฟลเดอร์ไม่ได้เก็บ timezone ไว้ จึงถือว่าเป็นเวลาในโซนที่ระบบใช้อยู่
+    (โซนเดียวกับที่ตั้งชื่อ) แล้วติด tzinfo ให้เพื่อเทียบกับ `now()` ได้ตรง ๆ
+    """
     if not path.name.startswith(SESSION_PREFIX):
         return None
     try:
-        return datetime.strptime(path.name[len(SESSION_PREFIX):], STAMP_FORMAT)
+        stamp = datetime.strptime(path.name[len(SESSION_PREFIX):], STAMP_FORMAT)
     except ValueError:
         return None
+    return stamp.replace(tzinfo=tz if isinstance(tz, ZoneInfo) else zone(tz))
 
 
-def purge_old_sessions(root: Path, days: int,
-                       now: datetime | None = None) -> list[Path]:
+def purge_old_sessions(root: Path, days: int, at: datetime | None = None,
+                       tz: str | ZoneInfo | None = None) -> list[Path]:
     """ลบโฟลเดอร์ session ที่เก่ากว่า `days` วัน — คืนรายการที่ลบไปจริง
 
     `days <= 0` = ไม่ลบอะไรเลย (ค่าเริ่มต้น) เพราะบันทึกเป็นข้อมูลของผู้ใช้
@@ -75,12 +83,12 @@ def purge_old_sessions(root: Path, days: int,
     """
     if days <= 0 or not root.is_dir():
         return []
-    cutoff = (now or datetime.now()) - timedelta(days=days)
+    cutoff = (at or now(tz)) - timedelta(days=days)
     removed: list[Path] = []
     for child in sorted(root.iterdir()):
         if not child.is_dir():
             continue
-        started = session_started_at(child)
+        started = session_started_at(child, tz)
         if started is None or started >= cutoff:
             continue
         try:
@@ -94,12 +102,14 @@ def purge_old_sessions(root: Path, days: int,
 class SessionLogger:
     def __init__(self, root: Path, save_audio: bool = False,
                  meta: dict | None = None, *, transcript: bool = True,
-                 retention_days: int = 0):
-        self.started = datetime.now()
+                 retention_days: int = 0, tz: str = DEFAULT_TZ):
+        # ทุก timestamp ในไฟล์เดียวกันต้องมาจาก timezone เดียวกัน (P3-20 / AC-20.4)
+        self.tz = zone(tz)
+        self.started = now(self.tz)
         self.transcript = transcript
         root = Path(root)
         private_dir(root)
-        self.purged = purge_old_sessions(root, retention_days)
+        self.purged = purge_old_sessions(root, retention_days, tz=self.tz)
         stamp = self.started.strftime(STAMP_FORMAT)
         self.dir = private_dir(root / f"{SESSION_PREFIX}{stamp}")
         self.jsonl = private_file(self.dir / "session.jsonl")
@@ -148,7 +158,7 @@ class SessionLogger:
         return out
 
     def event(self, kind: str, **fields) -> None:
-        rec = {"ts": datetime.now().isoformat(timespec="milliseconds"), "type": kind}
+        rec = {"ts": now(self.tz).isoformat(timespec="milliseconds"), "type": kind}
         rec.update(self._scrub(fields))
         with self._lock, self.jsonl.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -164,7 +174,7 @@ class SessionLogger:
             extra = "  \n> _(ถูกพูดขัดกลางประโยค)_"
         for i, s in enumerate(fields.get("sources") or [], 1):
             extra += f"\n> 🔎 [{i}] [{s.get('title') or s.get('url')}]({s.get('url')})"
-        stamp = datetime.now().strftime("%H:%M:%S")
+        stamp = now(self.tz).strftime("%H:%M:%S")
         with self._lock, self.md.open("a", encoding="utf-8") as f:
             f.write(f"**{who}** `{stamp}`\n\n{text.strip()}{extra}\n\n")
 
@@ -184,6 +194,6 @@ class SessionLogger:
             return
         with self._lock, self.md.open("a", encoding="utf-8") as f:
             f.write(
-                f"\n---\n\nจบการสนทนา: {datetime.now().strftime('%H:%M:%S')} "
+                f"\n---\n\nจบการสนทนา: {now(self.tz).strftime('%H:%M:%S')} "
                 f"(รวม {int(dur // 60)} นาที {int(dur % 60)} วินาที, {self._turns} ข้อความ)\n"
             )

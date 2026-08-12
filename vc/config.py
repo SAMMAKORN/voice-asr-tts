@@ -16,10 +16,15 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# เวลาของระบบ (P3-20) — บอกโมเดลว่า "ตามเวลาประเทศไทย" จึงต้องเป็นเวลาไทยจริง
+# ไม่ใช่เวลาของเครื่อง (บน container ที่ตั้ง TZ=UTC เดิมเพี้ยนไป 7 ชั่วโมง)
+DEFAULT_TZ = "Asia/Bangkok"
 
 THAI_DAYS = ("วันจันทร์", "วันอังคาร", "วันพุธ", "วันพฤหัสบดี",
              "วันศุกร์", "วันเสาร์", "วันอาทิตย์")
@@ -108,6 +113,25 @@ def _f(key: str, default: float, warnings: list[str] | None = None) -> float:
 
 def _i(key: str, default: int, warnings: list[str] | None = None) -> int:
     return int(_num(key, default, warnings))
+
+
+def zone(name: str | None = None) -> ZoneInfo:
+    """timezone ที่ใช้ทั้งระบบ — ตั้งได้ด้วย `APP_TZ` (ค่าเริ่มต้น Asia/Bangkok)
+
+    ชื่อโซนที่ไม่รู้จักไม่ควรทำให้เปิดโปรแกรมไม่ได้ จึงเตือนแล้วถอยไปใช้เวลาไทย
+    """
+    key = (name or os.environ.get("APP_TZ") or "").strip() or DEFAULT_TZ
+    try:
+        return ZoneInfo(key)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        warn(f"APP_TZ={key!r} ไม่ใช่ชื่อ timezone ที่รู้จัก "
+             f"(เช่น Asia/Bangkok, UTC) — ใช้ {DEFAULT_TZ} แทน")
+        return ZoneInfo(DEFAULT_TZ)
+
+
+def now(tz: str | ZoneInfo | None = None) -> datetime:
+    """เวลาปัจจุบันที่มี timezone กำกับเสมอ — ห้ามใช้ `datetime.now()` เปล่าในโปรเจกต์นี้"""
+    return datetime.now(tz if isinstance(tz, ZoneInfo) else zone(tz))
 
 
 def log_dir() -> Path:
@@ -222,6 +246,9 @@ class Config:
     history_turns: int = 20      # จำนวนข้อความย้อนหลังที่ส่งให้โมเดล
     keep_findings: int = 4       # จำนวนผลค้นเว็บย้อนหลังที่คงไว้ในความจำ
 
+    # เวลาที่ใช้ทั้งการบอกโมเดลและการตั้งชื่อ/ปั๊มเวลาในบันทึก (P3-20)
+    tz: str = DEFAULT_TZ
+
     # --- บันทึกการสนทนา (P3-18) ---
     log_dir: Path = field(default_factory=lambda: ROOT / "logs")
     log_transcript: bool = True   # False = ไม่เขียนคำพูดลงดิสก์เลย (เก็บแค่ latency)
@@ -242,16 +269,23 @@ class Config:
     def frame_samples(self) -> int:
         return int(self.mic_sr * self.frame_ms / 1000)
 
+    def now(self) -> datetime:
+        """เวลาปัจจุบันตาม timezone ของคอนฟิกนี้ (มี tzinfo กำกับเสมอ)"""
+        return now(self.tz)
+
     def system_message(self) -> dict:
         """ประกอบ system prompt: กติกาเครื่องมือ → วันเวลาปัจจุบัน → บุคลิกที่ผู้ใช้ตั้ง
 
         ลำดับสำคัญมาก — ถ้าเอากติกาเครื่องมือไปต่อท้าย โมเดลจะมองข้ามแล้วเดาคำตอบเอง
         (ทดสอบแล้ว: ต่อท้าย = ไม่เรียกค้นเลย · ขึ้นต้น = เรียกถูกจังหวะทุกครั้ง)
         """
-        now = datetime.now()
-        stamp = (f"ตอนนี้คือ{THAI_DAYS[now.weekday()]}ที่ {now.day} "
-                 f"{THAI_MONTHS[now.month - 1]} พ.ศ. {now.year + 543} "
-                 f"(ค.ศ. {now.year}) เวลา {now:%H:%M} น. ตามเวลาประเทศไทย")
+        # ต้องระบุ timezone: บน container ที่ TZ=UTC `datetime.now()` เปล่าให้เวลา
+        # เพี้ยนไป 7 ชั่วโมง แล้วโมเดลตอบเรื่อง "ตอนนี้" ผิดวันไปเลย (P3-20)
+        stamp_at = self.now()
+        where = "ตามเวลาประเทศไทย" if self.tz == DEFAULT_TZ else f"ตามเขตเวลา {self.tz}"
+        stamp = (f"ตอนนี้คือ{THAI_DAYS[stamp_at.weekday()]}ที่ {stamp_at.day} "
+                 f"{THAI_MONTHS[stamp_at.month - 1]} พ.ศ. {stamp_at.year + 543} "
+                 f"(ค.ศ. {stamp_at.year}) เวลา {stamp_at:%H:%M} น. {where}")
         parts = []
         if self.web_search:
             parts.append(TOOL_INSTRUCTION)
@@ -352,6 +386,7 @@ def load_config() -> Config:
         reply_max_sentences=_i("REPLY_MAX_SENTENCES", 4, w),
         reply_max_chars=_i("REPLY_MAX_CHARS", 320, w),
         keep_findings=_i("KEEP_FINDINGS", 4, w),
+        tz=(os.environ.get("APP_TZ") or "").strip() or DEFAULT_TZ,
         log_dir=log_dir(),
         log_transcript=_b("LOG_TRANSCRIPT", True, w),
         log_retention_days=_i("LOG_RETENTION_DAYS", 0, w),

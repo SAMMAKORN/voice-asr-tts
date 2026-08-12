@@ -63,6 +63,7 @@ class VoiceChat:
             save_audio=cfg.save_audio,
             transcript=cfg.log_transcript,
             retention_days=cfg.log_retention_days,
+            tz=cfg.tz,
             meta={
                 "chat_model": cfg.chat_model,
                 "asr_model": cfg.asr_model,
