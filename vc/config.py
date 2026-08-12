@@ -107,6 +107,10 @@ class Config:
     tts_chunk_chars: int = 60         # ขนาดก้อนที่สอง (ต้องสังเคราะห์ทันก่อนก้อนแรกเล่นจบ)
     tts_chunk_growth: float = 1.8     # ก้อนถัด ๆ ไปโตขึ้นเท่านี้ (ลดจำนวนครั้งที่เสียงเปลี่ยน)
     tts_search_filler: bool = True    # พูด "ขอค้นข้อมูลสักครู่" ระหว่างค้นเน็ตไหม
+    # เพดานความยาวคำตอบ บังคับในโค้ด ไม่พึ่ง prompt อย่างเดียว (P2-15)
+    # ปิดเพดานตัวอักษร: ตั้งค่าสูงมาก (เช่น 9999) · ปิดเพดานประโยค: ตั้ง 0
+    reply_max_sentences: int = 4
+    reply_max_chars: int = 320
     save_audio: bool = False
     history_turns: int = 20      # จำนวนข้อความย้อนหลังที่ส่งให้โมเดล
     keep_findings: int = 4       # จำนวนผลค้นเว็บย้อนหลังที่คงไว้ในความจำ
@@ -181,6 +185,8 @@ def load_config() -> Config:
         tts_chunk_chars=_i("TTS_CHUNK_CHARS", 60),
         tts_chunk_growth=_f("TTS_CHUNK_GROWTH", 1.8),
         tts_search_filler=_b("TTS_SEARCH_FILLER", True),
+        reply_max_sentences=_i("REPLY_MAX_SENTENCES", 4),
+        reply_max_chars=_i("REPLY_MAX_CHARS", 320),
         keep_findings=_i("KEEP_FINDINGS", 4),
         web_search=_b("WEB_SEARCH", True),
         search_results=_i("SEARCH_RESULTS", 5),
