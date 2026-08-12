@@ -7,6 +7,9 @@ sounddevice>=0.4.6
 fastapi>=0.110
 uvicorn[standard]>=0.29
 
+# --- เฉพาะตอนทดสอบ (pytest tests/) ---
+pytest>=8.0
+
 # --- เฉพาะตอนทดสอบด้วยเบราว์เซอร์จริง (tests/test_browser.py) ---
 # ติดตั้งเพิ่มเองเมื่อต้องใช้:
 #   pip install playwright && python3 -m playwright install chromium
