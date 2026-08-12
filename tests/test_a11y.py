@@ -166,12 +166,15 @@ def test_clay_faint_text_passes_wcag_aa(surface: str) -> None:
 
 
 def test_clay_faint_is_still_fainter_than_body_text() -> None:
-    """AC-17.3 — ลำดับชั้นสายตาต้องอยู่: text เข้มสุด → dim → faint"""
+    """AC-17.3 — faint ต้องยังจางกว่าตัวอักษรปกติ (--text)
+
+    หมายเหตุที่ต้องให้คนตัดสิน: ค่า `#6a5b64` ที่ brief กำหนดมา ทำให้ faint (6.15:1)
+    "เข้มกว่า" `--dim` (4.88:1) ลำดับสามชั้นเดิม text → dim → faint จึงเหลือสองชั้น
+    ถ้าต้องการไล่ระดับครบสามชั้นเหมือนเดิม ต้องทำให้ `--dim` เข้มขึ้นด้วย ซึ่งอยู่นอก
+    ขอบเขตที่ brief สั่งไว้ (สั่งให้แก้เฉพาะ --faint) จึงยังไม่แตะ
+    """
     bg = CLAY["--panel-solid"]
-    text = contrast(CLAY["--text"], bg)
-    dim = contrast(CLAY["--dim"], bg)
-    faint = contrast(CLAY["--faint"], bg)
-    assert text > dim > faint
+    assert contrast(CLAY["--text"], bg) > contrast(CLAY["--faint"], bg)
 
 
 def test_hud_theme_colours_are_untouched() -> None:
