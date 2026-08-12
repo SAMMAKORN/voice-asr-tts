@@ -1,4 +1,10 @@
-"""ไมโครโฟน (สตรีมต่อเนื่อง) + ลำโพง (คิวเล่นเสียงที่หยุดกลางทางได้)"""
+"""ไมโครโฟน (สตรีมต่อเนื่อง) + ลำโพง (คิวเล่นเสียงที่หยุดกลางทางได้)
+
+`sounddevice` ถูก import ตอนเปิดอุปกรณ์จริงเท่านั้น (P3-21) เพราะการ import ที่ระดับ
+โมดูลจะโหลด PortAudio ทันที ทำให้ import โมดูลนี้ (ซึ่งโหมดเว็บทำผ่าน vc.chat) ล้ม
+ทั้งกระบวนการบนเครื่อง/คอนเทนเนอร์ที่ไม่มีอุปกรณ์เสียง ทั้งที่โหมดเว็บใช้ไมค์และลำโพง
+ของเบราว์เซอร์ ไม่ได้แตะอุปกรณ์ในเครื่องเลย
+"""
 from __future__ import annotations
 
 import collections
@@ -17,9 +23,27 @@ warnings.filterwarnings(
     "ignore", message="Setting the shape on a NumPy array",
     category=DeprecationWarning)
 
-import sounddevice as sd  # noqa: E402
-
 CLOSE_TIMEOUT = 2.0     # รอปิด stream ได้นานสุดเท่านี้ (ดู close_stream)
+
+NO_AUDIO_HINT = (
+    "เปิดอุปกรณ์เสียงในเครื่องไม่ได้: {error}\n"
+    "  · โหมดเว็บไม่ต้องใช้ไลบรารีนี้ (ใช้ไมค์/ลำโพงของเบราว์เซอร์) — "
+    "รันด้วย `python3 -m web.server`\n"
+    "  · โหมดเทอร์มินัลต้องมี PortAudio + sounddevice: "
+    "`brew install portaudio` แล้ว `pip install sounddevice`")
+
+
+def sd():
+    """คืนโมดูล `sounddevice` — import ตอนเรียกใช้จริงเท่านั้น
+
+    ตัว import เองแคชอยู่ใน `sys.modules` แล้ว การเรียกซ้ำจึงแทบไม่มีต้นทุน
+    และไม่แคชไว้เองเพื่อให้เทสต์สลับตัวปลอมได้
+    """
+    try:
+        import sounddevice
+    except Exception as exc:  # noqa: BLE001 — ไม่มีไลบรารี/ไม่มี PortAudio/ไม่มีอุปกรณ์
+        raise RuntimeError(NO_AUDIO_HINT.format(error=exc)) from exc
+    return sounddevice
 
 
 def rms_i16(frame: np.ndarray) -> float:
@@ -30,7 +54,7 @@ def rms_i16(frame: np.ndarray) -> float:
 
 
 def list_devices() -> str:
-    return str(sd.query_devices())
+    return str(sd().query_devices())
 
 
 def close_stream(stream) -> bool:
@@ -90,7 +114,7 @@ class Microphone:
         self.dropped = 0         # คิวเต็มจนต้องทิ้งเฟรม (VAD จะไม่ได้ยินช่วงนั้น)
         self.gain = 1.0          # ขยายเสียงฝั่งซอฟต์แวร์ (ดู set_gain)
         self.clipped = 0         # ขยายแล้วชนขอบ 32767 (เสียงเพี้ยน ASR ถอดพลาด)
-        self._stream: sd.InputStream | None = None
+        self._stream = None      # sounddevice.InputStream (ผูกตอน start())
 
     @property
     def frame_samples(self) -> int:
@@ -106,15 +130,16 @@ class Microphone:
         return self.gain
 
     def start(self) -> int:
+        audio = sd()          # โหลด PortAudio ตอนนี้ ไม่ใช่ตอน import โมดูล
         last_err: Exception | None = None
         for sr in (self.target_sr, 48000, 44100, 0):
             try:
                 if sr == 0:  # ปล่อยให้อุปกรณ์เลือกอัตราของตัวเอง
-                    info = sd.query_devices(self.device if self.device is not None
-                                            else sd.default.device[0], "input")
+                    info = audio.query_devices(self.device if self.device is not None
+                                               else audio.default.device[0], "input")
                     sr = int(info["default_samplerate"])
                 block = int(sr * self.frame_ms / 1000)
-                stream = sd.InputStream(
+                stream = audio.InputStream(
                     samplerate=sr, blocksize=block, device=self.device,
                     channels=1, dtype="int16", callback=self._callback,
                 )
@@ -176,13 +201,14 @@ class Speaker:
         self._out_rms: collections.deque[float] = collections.deque([0.0] * 10, maxlen=10)
         self.finished_tags: list[object] = []
         self._epoch: int | None = None    # None = ปิดประตู (ยังไม่มีเทิร์นที่อนุญาต)
-        self._stream: sd.OutputStream | None = None
+        self._stream = None      # sounddevice.OutputStream (ผูกตอน start())
 
     def start(self) -> int:
+        audio = sd()          # โหลด PortAudio ตอนนี้ ไม่ใช่ตอน import โมดูล
         last_err: Exception | None = None
         for sr in (self.src_sr, 48000, 44100, 22050, 16000):
             try:
-                stream = sd.OutputStream(
+                stream = audio.OutputStream(
                     samplerate=sr, blocksize=int(sr * 0.02), device=self.device,
                     channels=1, dtype="int16", callback=self._callback,
                 )

@@ -171,6 +171,7 @@ def test_dead_code_is_gone(pattern: str) -> None:
 
 
 def test_unused_colour_import_is_gone() -> None:
-    line = [l for l in (ROOT / "voice_chat.py").read_text(encoding="utf-8").splitlines()
-            if l.startswith("from vc.ui import")][0]
+    """GRAY ถูก import มาโดยไม่มีใครใช้ (คลาสหลักย้ายไป vc/chat.py แล้วใน P3-21)"""
+    lines = (ROOT / "vc" / "chat.py").read_text(encoding="utf-8").splitlines()
+    line = [l for l in lines if l.startswith("from .ui import")][0]
     assert "GRAY" not in line

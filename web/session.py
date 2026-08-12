@@ -5,19 +5,23 @@
 """
 from __future__ import annotations
 
-import argparse
 import threading
 import time
 
 import numpy as np
 
-from vc.api import ApiClient, ApiError
+from vc.chat import VoiceChat
 from vc.config import Config
+from vc.options import RuntimeOptions
 from vc.phase import TurnPhase
+from vc.selftest import run_selftest
 from vc.vad import VoiceGate
-from voice_chat import GREETING, VoiceChat
 
 from .bridge import Outbox, WebConsole, WebMic, WebSpeaker
+
+# ตรวจระบบใช้โค้ดชุดเดียวกับ CLI แล้ว (P3-21) — ชื่อเดิมยัง import จากที่นี่ได้
+__all__ = ["WebSession", "run_selftest", "LEVEL_INTERVAL", "MAX_TEXT_CHARS",
+           "MAX_AUDIO_BYTES", "CLIENT_MESSAGES"]
 
 LEVEL_INTERVAL = 0.1      # ส่งระดับเสียงให้ UI วาดมิเตอร์ ~10 ครั้ง/วินาที
 
@@ -63,11 +67,9 @@ METRIC_SKIP = {"text", "spoken", "audio_file", "meta", "sources"}
 
 class WebSession(VoiceChat):
     def __init__(self, cfg: Config, out: Outbox):
-        args = argparse.Namespace(
-            no_mic=False, greet=True, save_audio=cfg.save_audio,
-            headphones=not cfg.echo_guard, no_tts=not cfg.tts_enabled,
-        )
-        super().__init__(cfg, args, console=WebConsole(out))
+        # ไม่ต้องปลอม argparse.Namespace อีกแล้ว — แกนกลางประกาศสัญญาของตัวเองไว้
+        super().__init__(cfg, RuntimeOptions(no_mic=False, greet=True),
+                         console=WebConsole(out))
         self.out = out
         self.mic = WebMic(cfg.mic_sr, cfg.frame_ms)
         self.speaker = WebSpeaker(out, cfg.speaker_sr)
@@ -279,52 +281,3 @@ class WebSession(VoiceChat):
                 self.out.json("closed")
                 self.out.close()
 
-
-# --------------------------------------------------------------- ตรวจระบบ (onboarding)
-def run_selftest(cfg: Config) -> dict:
-    """เรียก TTS → ASR → LLM ครบวง แล้วคืนผลเป็นโครงสร้างให้หน้าเว็บแสดงทีละขั้น"""
-    api = ApiClient(cfg)
-    sample = "สวัสดีครับ วันนี้อากาศที่กรุงเทพเป็นอย่างไรบ้าง"
-    steps: list[dict] = []
-
-    def add(name: str, model: str, ok: bool, detail: str, ms: int) -> None:
-        steps.append({"name": name, "model": model, "ok": ok,
-                      "detail": detail, "ms": ms})
-
-    try:
-        t0 = time.perf_counter()
-        pcm = api.synthesize(sample, cfg.mic_sr)
-        add("TTS", cfg.tts_model, True,
-            f"สังเคราะห์เสียงได้ {pcm.size / cfg.mic_sr:.2f} วินาที",
-            int((time.perf_counter() - t0) * 1000))
-
-        t0 = time.perf_counter()
-        text = api.transcribe(pcm, cfg.mic_sr)
-        add("ASR", cfg.asr_model, bool(text), text or "ถอดเสียงไม่ได้ข้อความ",
-            int((time.perf_counter() - t0) * 1000))
-
-        t0 = time.perf_counter()
-        cancel = threading.Event()
-        msgs = [{"role": "system", "content": cfg.system_prompt},
-                {"role": "user", "content": text or sample}]
-        out, first = "", None
-        for delta in api.chat_stream(msgs, cancel):
-            if first is None:
-                first = int((time.perf_counter() - t0) * 1000)
-            out += delta
-            if len(out) > 400:
-                cancel.set()
-        add("LLM", cfg.chat_model, first is not None,
-            out.strip()[:160] or "โมเดลไม่ส่งข้อความกลับมา",
-            first or int((time.perf_counter() - t0) * 1000))
-    except ApiError as exc:
-        steps.append({"name": "ผิดพลาด", "model": "", "ok": False,
-                      "detail": str(exc)[:300], "ms": 0})
-    except Exception as exc:  # noqa: BLE001
-        steps.append({"name": "ผิดพลาด", "model": "", "ok": False,
-                      "detail": repr(exc)[:300], "ms": 0})
-    finally:
-        api.close()
-
-    return {"ok": bool(steps) and all(s["ok"] for s in steps), "steps": steps,
-            "greeting": GREETING}

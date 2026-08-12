@@ -130,7 +130,9 @@ def test_phase_transitions_are_logged(web_session, caplog) -> None:
 # ────────────────────────────────────────────────────── ไม่เหลือ busy คุม barge-in
 def test_no_busy_flag_drives_barge_in() -> None:
     """AC-5.4 — `busy` เหลือได้แค่ property เพื่อความเข้ากันได้ ห้ามใช้ตัดสินใจพูดแทรก"""
-    src = (ROOT / "voice_chat.py").read_text(encoding="utf-8")
+    # คลาส VoiceChat ย้ายจาก voice_chat.py ไป vc/chat.py แล้ว (P3-21) — เงื่อนไข
+    # ที่ตรวจข้างล่างเหมือนเดิมทุกตัวอักษร เปลี่ยนเฉพาะที่อยู่ของไฟล์
+    src = (ROOT / "vc" / "chat.py").read_text(encoding="utf-8")
     assert "self.busy = " not in src, "ยังมีการเขียนค่าใส่ธง busy อยู่"
     assert "def busy(self)" in src, "ควรเหลือ busy เป็น property (backward compat)"
 

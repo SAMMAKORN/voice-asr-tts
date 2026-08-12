@@ -99,7 +99,9 @@ def test_lock_does_not_add_noticeable_latency() -> None:
 # ───────────────────────────────────────────────────── ไม่มี pattern เดิมหลงเหลือ
 def test_no_check_then_play_pattern_left() -> None:
     """AC-12.3 — ต้องไม่เหลือ "เช็ค epoch แล้วค่อย play" นอก lock"""
-    src = (ROOT / "voice_chat.py").read_text(encoding="utf-8")
+    # คลาส VoiceChat ย้ายจาก voice_chat.py ไป vc/chat.py แล้ว (P3-21) — เงื่อนไข
+    # ที่ตรวจข้างล่างเหมือนเดิมทุกตัวอักษร เปลี่ยนเฉพาะที่อยู่ของไฟล์
+    src = (ROOT / "vc" / "chat.py").read_text(encoding="utf-8")
     calls = [line.strip() for line in src.splitlines() if "speaker.play(" in line]
     assert calls, "ไม่พบการเรียก speaker.play เลย — เทสต์นี้ล้าสมัยแล้ว"
     for line in calls:
