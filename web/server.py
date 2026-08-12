@@ -31,12 +31,11 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 def session_config() -> Config:
     """คอนฟิกใหม่ต่อหนึ่ง session (แต่ละแท็บปรับ mute/echo แยกกันได้)
 
-    ค่าเริ่มต้นฝั่งเว็บปิด echo guard ของเราเอง เพราะเบราว์เซอร์มี AEC
-    (echoCancellation) ที่ทำงานดีกว่าอยู่แล้ว — เปิดกลับได้จากปุ่มในหน้าเว็บ
+    เปิด echo guard ไว้ทั้งที่เบราว์เซอร์มี AEC ของตัวเองแล้ว เพราะจากบันทึกจริง
+    ลำโพงโน้ตบุ๊กยังรั่วเข้าไมค์พอให้ ASR เดาเป็นข้อความมั่ว ๆ แล้วไปตัดคำตอบทิ้ง
+    (ปิดได้จากปุ่มในหน้าเว็บถ้าใส่หูฟัง จะพูดแทรกได้ไวขึ้น)
     """
-    cfg = load_config()
-    cfg.echo_guard = False
-    return cfg
+    return load_config()
 
 
 @app.get("/")

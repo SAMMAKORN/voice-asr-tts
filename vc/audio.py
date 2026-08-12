@@ -2,11 +2,24 @@
 from __future__ import annotations
 
 import collections
+import platform
 import queue
+import subprocess
 import threading
+import warnings
 
 import numpy as np
-import sounddevice as sd
+
+# numpy 2.5 ประกาศเลิกใช้ `arr.shape = ...` ซึ่ง sounddevice 0.5.x เรียกทุกเฟรม
+# ถ้าไม่ปิดไว้ กลไก warning ของ Python (รวม regex) จะถูกรันในเธรดเสียงเรียลไทม์
+# 50-100 ครั้งต่อวินาที ทำให้เสียงกระตุกและเพิ่มโอกาสค้างตอนปิด stream
+warnings.filterwarnings(
+    "ignore", message="Setting the shape on a NumPy array",
+    category=DeprecationWarning)
+
+import sounddevice as sd  # noqa: E402
+
+CLOSE_TIMEOUT = 2.0     # รอปิด stream ได้นานสุดเท่านี้ (ดู close_stream)
 
 
 def rms_i16(frame: np.ndarray) -> float:
@@ -20,6 +33,49 @@ def list_devices() -> str:
     return str(sd.query_devices())
 
 
+def close_stream(stream) -> bool:
+    """ปิด stream ในเธรดแยก พร้อม timeout — คืน False ถ้าปิดไม่ลง
+
+    บน macOS มีจังหวะที่ Pa_StopStream ค้างรอ mutex ของ CoreAudio ขณะที่เธรด
+    เสียงของ CoreAudio เองก็ค้างรอ mutex อีกตัวอยู่ = deadlock ถาวร ถ้าเรียกจาก
+    เธรดหลักตรง ๆ โปรแกรมจะแขวนหลังกด Ctrl+C แล้วโปรเซสไม่ยอมตาย
+    (เจอจริง: main thread ค้างใน AudioOutputUnitStop รอ HAL_HardwarePlugIn mutex)
+
+    จึงยิงคำสั่งปิดในเธรด daemon แล้วรอแบบมีเพดานเวลา ถ้าเกินก็ปล่อยทิ้งไป
+    ให้เธรดหลักเดินต่อได้ และใช้ abort() แทน stop() เพราะไม่ต้องรอบัฟเฟอร์หมด
+    """
+    done = threading.Event()
+
+    def worker() -> None:
+        try:
+            stream.abort(ignore_errors=True)
+        finally:
+            try:
+                stream.close(ignore_errors=True)
+            finally:
+                done.set()
+
+    threading.Thread(target=worker, name="audio-close", daemon=True).start()
+    return done.wait(CLOSE_TIMEOUT)
+
+
+def mac_input_volume() -> int | None:
+    """ระดับ gain ขาเข้าของ macOS (0-100) — คืน None ถ้าอ่านไม่ได้/ไม่ใช่ macOS
+
+    ค่านี้คูณกับเสียงที่ไมค์ส่งเข้ามาตรง ๆ ถ้าถูกหรี่ไว้ต่ำ VAD จะไม่ได้ยิน
+    อะไรเลยทั้งที่ไมค์ทำงานปกติ (เบราว์เซอร์ไม่เจอปัญหานี้เพราะมี AGC ของตัวเอง)
+    """
+    if platform.system() != "Darwin":
+        return None
+    try:
+        out = subprocess.run(
+            ["osascript", "-e", "input volume of (get volume settings)"],
+            capture_output=True, text=True, timeout=3.0)
+        return int(out.stdout.strip())
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class Microphone:
     """อัดเสียงตลอดเวลา ส่งเฟรมขนาด frame_ms เข้าคิวให้ VAD ไปวิเคราะห์"""
 
@@ -30,11 +86,22 @@ class Microphone:
         self.frames: queue.Queue[np.ndarray] = queue.Queue(maxsize=250)
         self.native_sr = samplerate
         self.overflows = 0
+        self.gain = 1.0          # ขยายเสียงฝั่งซอฟต์แวร์ (ดู set_gain)
+        self.clipped = 0
         self._stream: sd.InputStream | None = None
 
     @property
     def frame_samples(self) -> int:
         return int(self.target_sr * self.frame_ms / 1000)
+
+    def set_gain(self, gain: float) -> float:
+        """ตั้งอัตราขยายเสียงขาเข้า (แทน AGC ของเบราว์เซอร์ที่ฝั่งนี้ไม่มี)
+
+        ขยายทั้งเสียงพูดและเสียงรบกวนเท่ากัน อัตราส่วนสัญญาณต่อสัญญาณรบกวน
+        จึงไม่เปลี่ยน เกณฑ์ของ VAD ที่ตั้งไว้กับระดับเสียง "ปกติ" เลยกลับมาใช้ได้
+        """
+        self.gain = float(np.clip(gain, 1.0, 20.0))
+        return self.gain
 
     def start(self) -> int:
         last_err: Exception | None = None
@@ -68,19 +135,20 @@ class Microphone:
                 src = np.linspace(0.0, 1.0, frame.size, endpoint=False)
                 dst = np.linspace(0.0, 1.0, n, endpoint=False)
                 frame = np.interp(dst, src, frame.astype(np.float32)).astype(np.int16)
+        if self.gain != 1.0:
+            boosted = frame.astype(np.float32) * self.gain
+            if np.abs(boosted).max(initial=0.0) > 32767.0:
+                self.clipped += 1
+            frame = np.clip(boosted, -32768.0, 32767.0).astype(np.int16)
         try:
             self.frames.put_nowait(frame)
         except queue.Full:
             pass
 
     def stop(self) -> None:
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            close_stream(stream)
 
 
 class Speaker:
@@ -169,12 +237,8 @@ class Speaker:
         """RMS สูงสุดใน ~200ms ที่ผ่านมา (ครอบ latency ของเสียงที่วนกลับเข้าไมค์)"""
         return max(self._out_rms) if self._out_rms else 0.0
 
-    def close(self) -> None:
+    def close(self) -> bool:
+        """คืน False ถ้าปิด stream ไม่ลงในเวลาที่กำหนด (ดู close_stream)"""
         self.stop()
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
+        stream, self._stream = self._stream, None
+        return close_stream(stream) if stream is not None else True

@@ -366,9 +366,16 @@ def phase_talk(pw, port: int, convo: Path, headed: bool) -> None:
     check("กดซ้ำแล้วเปิดเสียงกลับ",
           page.locator("#btn-mute").get_attribute("data-on") == "0")
 
+    # ค่าเริ่มต้นเปลี่ยนได้ตาม ECHO_GUARD ใน .env จึงเช็คว่า "สลับได้" ไม่ใช่ค่าตายตัว
+    echo_before = page.locator("#btn-echo").get_attribute("data-on")
     page.click("#btn-echo")
+    page.wait_for_function(
+        f"() => document.getElementById('btn-echo').dataset.on !== '{echo_before}'",
+        timeout=5000)
     check("ปุ่มโหมดลำโพง/หูฟังสลับได้",
-          page.locator("#btn-echo").get_attribute("data-on") == "1")
+          page.locator("#btn-echo").get_attribute("data-on") != echo_before,
+          f"{echo_before} → {page.locator('#btn-echo').get_attribute('data-on')}")
+    page.click("#btn-echo")
 
     before = page.locator(".msg").count()
     page.click("#btn-clear")

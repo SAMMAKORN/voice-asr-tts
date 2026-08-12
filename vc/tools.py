@@ -46,15 +46,20 @@ TOOLS: list[dict] = [
 ]
 
 
+NOTE_MAX_CHARS = 900     # ความยาวผลค้นที่เก็บไว้เป็นความจำข้ามเทิร์น
+
+
 class ToolRunner:
     """รันเครื่องมือให้โมเดล พร้อมเก็บแหล่งที่มาไว้แสดงให้ผู้ใช้เห็น"""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.sources: list[dict] = []      # {title, url} ที่ใช้ไปในเทิร์นนี้
+        self.notes: list[str] = []         # สรุปสิ่งที่ค้นเจอ ไว้ใช้เป็นความจำเทิร์นถัดไป
 
     def reset(self) -> None:
         self.sources = []
+        self.notes = []
 
     def _remember(self, items: list[dict]) -> list[dict]:
         """เก็บแหล่งที่มาไว้โชว์ พร้อมชื่อโดเมนที่อ่านออก
@@ -73,6 +78,11 @@ class ToolRunner:
         return fresh
 
     def run(self, name: str, args: dict) -> str:
+        out = self._run(name, args)
+        self.notes.append(f"{describe(name, args)}\n{out[:NOTE_MAX_CHARS]}")
+        return out
+
+    def _run(self, name: str, args: dict) -> str:
         try:
             if name == "web_search":
                 results = websearch.search(

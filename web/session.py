@@ -125,7 +125,7 @@ class WebSession(VoiceChat):
             self.cfg.echo_guard = bool(msg.get("on"))
             self.out.json("setting", key="echo_guard", on=self.cfg.echo_guard)
         elif kind == "clear":
-            self.messages = [self.cfg.system_message()]
+            self.reset_history()
             self.log.event("history_cleared")
             self.out.json("cleared")
         elif kind == "quit":
