@@ -1,0 +1,13 @@
+.git
+.github
+.claude
+.env
+.env.*
+!.env.example
+.venv
+__pycache__
+*.py[cod]
+*.log
+.DS_Store
+logs
+tests/_fakemic

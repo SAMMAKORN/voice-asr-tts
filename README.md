@@ -68,6 +68,20 @@ python3 -m web.server
 - การเปิดใช้งานจากเครื่องอื่นในวง LAN ทำได้ด้วย `python3 -m web.server --host 0.0.0.0`
   แต่เบราว์เซอร์จะอนุญาตสิทธิ์ไมโครโฟนเฉพาะที่ `localhost` หรือผ่าน HTTPS เท่านั้น
 
+### Deploy บน Coolify จาก Private Repository
+
+โปรเจกต์มี `Dockerfile` พร้อมให้ Coolify build ได้โดยตรง:
+
+1. เชื่อม GitHub App ของ Coolify และให้สิทธิ์เข้าถึง repository นี้
+2. สร้าง Resource แบบ **Private Repository (with GitHub App)** แล้วเลือก repository และ branch
+3. เลือก Build Pack เป็น **Dockerfile** โดยใช้ Dockerfile Location เป็น `/Dockerfile`
+4. ตั้ง Port เป็น `8000` และผูก domain เพื่อให้ Coolify ออก HTTPS ให้อัตโนมัติ (จำเป็นสำหรับการใช้ไมโครโฟนบนเบราว์เซอร์)
+5. เพิ่ม Environment Variables จาก `.env.example` ใน Coolify อย่างน้อยต้องมี `API_BASE_URL` และ `API_KEY` โดยไม่ต้อง commit ไฟล์ `.env`
+6. กด Deploy; container จะรับค่า `PORT` จาก Coolify ได้ และจะใช้ `8000` เป็นค่าเริ่มต้น
+
+โฟลเดอร์ `logs/` อยู่ภายใน container และจะหายเมื่อ redeploy หากต้องการเก็บบันทึกถาวร
+ให้เพิ่ม Persistent Storage ของ Coolify โดย mount ไปที่ `/app/logs`
+
 ---
 
 ## 3. โหมดเทอร์มินัล
