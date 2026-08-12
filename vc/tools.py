@@ -98,6 +98,7 @@ class ToolRunner:
                 text = websearch.fetch_page(
                     url, max_chars=self.cfg.fetch_max_chars,
                     timeout=self.cfg.search_timeout,
+                    max_bytes=self.cfg.fetch_max_bytes,
                 )
                 self._remember([{"title": text.split("\n", 1)[0][:120], "url": url}])
                 return text

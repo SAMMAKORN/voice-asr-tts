@@ -114,6 +114,7 @@ class Config:
     search_results: int = 5
     search_timeout: float = 12.0
     fetch_max_chars: int = 3000
+    fetch_max_bytes: int = 512_000   # เพดานไบต์ที่ยอมดาวน์โหลดต่อหนึ่งหน้าเว็บ
     tool_rounds: int = 2         # จำนวนรอบสูงสุดที่ยอมให้เรียกเครื่องมือ
 
     @property
@@ -180,5 +181,6 @@ def load_config() -> Config:
         search_results=_i("SEARCH_RESULTS", 5),
         search_timeout=_f("SEARCH_TIMEOUT", 12.0),
         fetch_max_chars=_i("FETCH_MAX_CHARS", 3000),
+        fetch_max_bytes=_i("FETCH_MAX_BYTES", 512_000),
         tool_rounds=_i("TOOL_ROUNDS", 2),
     )
