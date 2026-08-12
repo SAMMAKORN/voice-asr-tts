@@ -25,7 +25,7 @@ from vc.audio import Microphone, Speaker, list_devices, mac_input_volume
 from vc.chunker import SentenceChunker, clean_for_tts, split_for_tts
 from vc.config import Config, load_config
 from vc.logger import SessionLogger
-from vc.tools import TOOLS, ToolRunner, describe
+from vc.tools import TOOLS, ToolRunner, describe, wrap_external
 from vc.ui import Console, CYAN, GREEN, GRAY, MAGENTA, YELLOW
 from vc.vad import VoiceGate
 
@@ -553,15 +553,18 @@ class VoiceChat:
     def _history(self) -> list[dict]:
         """system prompt + ผลค้นเว็บที่จำไว้ + บทสนทนาช่วงท้าย
 
-        ผลค้นเว็บถูกใส่เป็นข้อความ system แยก ไม่ใช่ role=tool เพราะการตัดประวัติ
-        อาจตัดจนเหลือ tool ที่ไม่มี tool_calls คู่กัน แล้ว API จะปฏิเสธทั้งคำขอ
+        ผลค้นเว็บใส่เป็น role=user ที่ห่อด้วย delimiter ของเนื้อหาภายนอก
+        **ห้ามเป็น system เด็ดขาด** — เนื้อหาที่ผู้โจมตีเขียนบนหน้าเว็บจะถูก
+        ยกระดับเป็นคำสั่งระดับระบบทันที (P1-4) และไม่ใช้ role=tool เพราะการตัด
+        ประวัติอาจตัดจนเหลือ tool ที่ไม่มี tool_calls คู่กัน แล้ว API ปฏิเสธทั้งคำขอ
         """
         keep = self.cfg.history_turns * 2
         head = self.messages[:1]
         tail = self.messages[1:][-keep:] if keep else self.messages[1:]
         if not self.findings:
             return head + tail
-        note = {"role": "system", "content": FINDINGS_HEADER + "\n\n".join(self.findings)}
+        note = {"role": "user",
+                "content": FINDINGS_HEADER + wrap_external("\n\n".join(self.findings))}
         return head + [note] + tail
 
     def reset_history(self) -> None:
