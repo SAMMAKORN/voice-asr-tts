@@ -209,9 +209,23 @@ function writeMsg(text) {
   scrollStream();
 }
 
+/* ประกาศให้ screen reader ครั้งเดียวตอนข้อความจบ (P3-16 / AC-16.1)
+   #stream ตั้ง aria-live="off" ไว้ เพราะข้อความต่อทีละ token ถ้าประกาศที่นั่น
+   ผู้ใช้ VoiceOver จะได้ยินย่อหน้าเดิมซ้ำทุกตัวอักษรจนฟังไม่รู้เรื่อง */
+function announce(text) {
+  const box = $('sr-live');
+  if (!box || !text) return;
+  // เขียนค่าเดิมทับค่าเดิม screen reader จะไม่ประกาศ — ล้างก่อนหนึ่งจังหวะ
+  box.textContent = '';
+  setTimeout(() => { box.textContent = text; }, 60);
+}
+
 function endMsg(note) {
   if (!msgEl) return;
   msgEl.classList.remove('live');
+  const said = msgEl.querySelector('.body').textContent.trim();
+  const who = msgEl.dataset.role === 'user' ? 'คุณพูดว่า' : 'AI ตอบว่า';
+  if (said) announce(`${who} ${said}${note ? ` (${note})` : ''}`);
   if (note) {
     const b = document.createElement('span');
     b.className = 'badge';
@@ -864,15 +878,36 @@ function showStep(n) {
   renderSteps();
 }
 
+/* คู่มือเป็น <dialog> จริง (P3-16): focus trap, background inert, ปิดด้วย Esc
+   และการคืนโฟกัสให้ปุ่มที่เปิดโมดัล เป็นหน้าที่ของเบราว์เซอร์ ไม่ต้องเขียนเลียนแบบ
+   (เบราว์เซอร์เก่าที่ไม่มี showModal ยังใช้ได้แบบ overlay ธรรมดา) */
+function markTourSeen() {
+  try { localStorage.setItem(TOUR_KEY, '1'); } catch (_) { /* localStorage ถูกปิด */ }
+}
+
+function tourIsOpen() {
+  const d = $('overlay');
+  return typeof d.showModal === 'function' ? d.open : !d.hidden;
+}
+
 function openTour(n) {
-  $('overlay').hidden = false;
+  const d = $('overlay');
+  d.hidden = false;
+  if (typeof d.showModal === 'function' && !d.open) d.showModal();
   showStep(n || 0);
 }
 
 function closeTour() {
-  $('overlay').hidden = true;
-  localStorage.setItem(TOUR_KEY, '1');
+  const d = $('overlay');
+  if (typeof d.close === 'function' && d.open) {
+    d.close();          // เหตุการณ์ 'close' ด้านล่างเป็นคนจำว่าดูคู่มือแล้ว
+    return;
+  }
+  d.hidden = true;
+  markTourSeen();
 }
+
+$('overlay').addEventListener('close', markTourSeen);
 
 $('tour-prev').addEventListener('click', () => showStep(step - 1));
 
@@ -887,8 +922,11 @@ $('tour-next').addEventListener('click', () => {
 
 $('tour-skip').addEventListener('click', closeTour);
 
+/* <dialog> ปิดด้วย Esc ให้เองอยู่แล้ว — เส้นทางนี้ไว้เผื่อเบราว์เซอร์ที่ไม่รองรับ */
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !$('overlay').hidden) closeTour();
+  if (e.key !== 'Escape') return;
+  if (typeof $('overlay').showModal === 'function') return;
+  if (tourIsOpen()) closeTour();
 });
 
 // ขั้นที่ 1 — ขอสิทธิ์ไมค์
@@ -987,9 +1025,7 @@ function row(icon, name, detail, ms, ok, model) {
     addLog('อ่านค่าตั้งจากเซิร์ฟเวอร์ไม่ได้', 'warn');
   }
 
-  if (localStorage.getItem(TOUR_KEY)) {
-    $('overlay').hidden = true;
-  } else {
-    openTour(0);
-  }
+  let seen = false;
+  try { seen = !!localStorage.getItem(TOUR_KEY); } catch (_) { /* localStorage ถูกปิด */ }
+  if (!seen) openTour(0);            // <dialog> ที่ยังไม่ open ถูกซ่อนอยู่แล้ว
 })();

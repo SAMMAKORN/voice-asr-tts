@@ -388,3 +388,91 @@ def test_each_mic_failure_gets_its_own_message(browser, server, name, needle) ->
     assert needle in text, f"{name} ได้ข้อความผิด: {text!r}"
     assert page.is_enabled("#btn-start"), "ต้องกดลองใหม่ได้"
     page.close()
+
+
+# ──────────────────────────────────────────────────────── P3-16 a11y (โมดัลคู่มือ)
+def test_guide_modal_traps_focus_and_gives_it_back(browser, server) -> None:
+    """AC-16.3 — Tab วนอยู่ในโมดัล กด Esc ปิดได้ และโฟกัสกลับไปที่ปุ่มที่เปิด"""
+    page = open_page(browser, server)
+    page.focus("#btn-help")
+    page.click("#btn-help")
+    page.wait_for_function("$('overlay').open === true")
+
+    # ไล่ Tab หลายรอบ โฟกัสต้องอยู่ในโมดัลตลอด ไม่หลุดไปปุ่มด้านหลัง
+    seen = []
+    for _ in range(12):
+        page.keyboard.press("Tab")
+        seen.append(page.evaluate("""() => {
+          const el = document.activeElement;
+          if (!el || el === document.body) return '(นอกหน้าเว็บ)';
+          return ($('overlay').contains(el) ? 'ใน:' : 'นอก:') + (el.id || el.tagName);
+        }"""))
+    # Chrome พา Tab ออกไปที่แถบเครื่องมือของเบราว์เซอร์ก่อนวนกลับ (พฤติกรรมปกติของ
+    # modal dialog) แต่ต้องไม่ไปหยุดที่ปุ่มของหน้าเว็บที่อยู่ข้างหลังโมดัลเด็ดขาด
+    outside = [s for s in seen if s.startswith('นอก:')]
+    assert outside == [], f"โฟกัสไปโดนของที่อยู่หลังโมดัล: {outside} (ทั้งหมด {seen})"
+    assert any(s.startswith('ใน:') for s in seen)
+
+    page.keyboard.press("Escape")
+    page.wait_for_function("$('overlay').open === false")
+    assert page.evaluate("() => document.activeElement.id") == "btn-help", (
+        "ปิดโมดัลแล้วโฟกัสต้องกลับไปที่ปุ่มที่เปิดมัน")
+    page.close()
+
+
+def test_guide_modal_hides_the_page_behind_it(browser, server) -> None:
+    """AC-16.3 — background ต้องเป็น inert (คลิก/โฟกัสไม่โดน)"""
+    page = open_page(browser, server)
+    page.click("#btn-help")
+    page.wait_for_function("$('overlay').open === true")
+    page.evaluate("() => $('btn-start').focus()")
+    assert page.evaluate("() => document.activeElement.id") != "btn-start"
+    page.close()
+
+
+def test_focus_ring_is_actually_painted_on_both_themes(browser, server) -> None:
+    """AC-16.2 — เดิมวงโฟกัสเป็น cyan จาง 8% (1.14:1) คือมองไม่เห็น"""
+    page = open_page(browser, server)
+    for theme in ("hud", "clay"):
+        page.evaluate("(t) => applyTheme(t)", theme)
+        page.keyboard.press("Tab")               # เข้าโหมดคีย์บอร์ด (:focus-visible)
+        page.focus("#btn-start")
+        shadow = page.evaluate(
+            "() => getComputedStyle($('btn-start')).boxShadow")
+        assert shadow and shadow != "none", f"ธีม {theme}: ไม่มีวงโฟกัสเลย"
+        assert shadow.count("rgb") >= 2, f"ธีม {theme}: วงโฟกัสไม่ครบสองชั้น ({shadow})"
+    page.close()
+
+
+def test_finished_reply_is_announced_exactly_once(browser, server) -> None:
+    """AC-16.1 — ประกาศ 1 ครั้งตอนจบ ไม่ใช่ทุก token"""
+    page = open_page(browser, server)
+    page.evaluate("""() => {
+      handleJson({ type: 'begin', role: 'assistant' });
+      for (const t of ['สวัสดี', 'ครับ', ' ยินดี', 'ต้อนรับ']) {
+        handleJson({ type: 'delta', text: t });
+      }
+    }""")
+    assert page.locator("#sr-live").inner_text().strip() == ""
+    page.evaluate("() => handleJson({ type: 'end' })")
+    page.wait_for_function("$('sr-live').textContent.trim().length > 0")
+    said = page.locator("#sr-live").inner_text()
+    assert "สวัสดีครับ ยินดีต้อนรับ" in said
+    assert said.count("สวัสดี") == 1
+    page.close()
+
+
+def test_whole_flow_works_with_the_keyboard_only(browser, server) -> None:
+    """AC-16.5 — เริ่ม → หยุด → เปิดคู่มือ → ปิด ด้วยคีย์บอร์ดล้วน"""
+    page = open_page(browser, server)
+    page.focus("#btn-start")
+    page.keyboard.press("Enter")
+    page.wait_for_function("live === true", timeout=5000)
+    page.focus("#btn-stop")
+    page.keyboard.press("Enter")
+    page.focus("#btn-help")
+    page.keyboard.press("Enter")
+    page.wait_for_function("$('overlay').open === true")
+    page.keyboard.press("Escape")
+    page.wait_for_function("$('overlay').open === false")
+    page.close()

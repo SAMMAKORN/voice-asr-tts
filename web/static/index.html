@@ -65,7 +65,10 @@
         <span class="spacer"></span>
         <span id="turn-count">0 ข้อความ</span>
       </div>
-      <div class="stream" id="stream">
+      <!-- aria-live="off" ตั้งใจ (P3-16): ข้อความต่อทีละ token ถ้าประกาศที่นี่
+           screen reader จะอ่านซ้ำทั้งย่อหน้าทุกตัวอักษร — ประกาศตอนจบข้อความ
+           ผ่าน #sr-live ด้านล่างแทน -->
+      <div class="stream" id="stream" aria-live="off">
         <div class="empty" id="empty">
           <span class="ring" aria-hidden="true">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
@@ -97,8 +100,9 @@
       </div>
 
       <div class="panel" style="min-height:0">
-        <div class="panel-head"><span>บันทึกระบบ</span></div>
-        <div class="logs" id="logs"></div>
+        <div class="panel-head"><span id="logs-label">บันทึกระบบ</span></div>
+        <div class="logs" id="logs" role="log" aria-live="polite"
+             aria-labelledby="logs-label"></div>
       </div>
     </aside>
   </div>
@@ -117,7 +121,8 @@
       </svg>
     </div>
 
-    <div class="status-text">
+    <!-- สถานะปัจจุบันเปลี่ยนเป็นก้อน ไม่ใช่ทีละตัวอักษร จึงประกาศตรงนี้ได้ (P3-16) -->
+    <div class="status-text" role="status" aria-live="polite" aria-atomic="true">
       <div class="now" id="status-now">กด “เริ่มระบบ” เพื่อเปิดไมโครโฟน</div>
       <div class="hint" id="status-hint">ครั้งแรกเบราว์เซอร์จะถามสิทธิ์ไมค์ — กดอนุญาต</div>
     </div>
@@ -143,14 +148,18 @@
       <input id="input" type="text" autocomplete="off" placeholder="พิมพ์แทนการพูดก็ได้ แล้วกด Enter" disabled>
       <button class="btn" type="submit" id="btn-send" disabled>ส่ง</button>
     </form>
+
+    <!-- ช่องประกาศให้ screen reader: เขียนลงที่นี่ "ตอนข้อความจบแล้ว" ครั้งเดียว
+         ต่อหนึ่งข้อความ (P3-16 / AC-16.1) ห้ามผูกกับ #stream ที่ต่อทีละ token -->
+    <p class="sr-only" id="sr-live" role="status" aria-live="polite" aria-atomic="true"></p>
   </footer>
 </div>
 
 <!-- ============ Onboarding ============ -->
-<div class="overlay" id="overlay">
-  <div class="tour" role="dialog" aria-modal="true" aria-labelledby="tour-title">
+<dialog class="overlay" id="overlay" aria-labelledby="tour-label">
+  <div class="tour">
     <div class="tour-head">
-      <span>คู่มือเริ่มต้น</span>
+      <span id="tour-label">คู่มือเริ่มต้น</span>
       <span class="steps" id="tour-steps"></span>
     </div>
 
@@ -254,7 +263,7 @@
       <button class="btn primary" id="tour-next">ถัดไป</button>
     </div>
   </div>
-</div>
+</dialog>
 
 <script src="/static/app.js"></script>
 </body>
