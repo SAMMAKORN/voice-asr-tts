@@ -27,6 +27,19 @@ def _i(key: str, default: int) -> int:
     return int(_f(key, default))
 
 
+def log_dir() -> Path:
+    """ที่เก็บบันทึกการสนทนา — ตั้งได้ด้วย `LOG_DIR` (P3-18)
+
+    รับได้ทั้ง path สัมบูรณ์และ path สัมพัทธ์ (อ้างจากรากโปรเจกต์ ไม่ใช่ cwd
+    เพราะโหมดเว็บถูกสั่งรันจากที่ไหนก็ได้ แต่บันทึกควรไปกองที่เดียวเสมอ)
+    """
+    raw = (os.environ.get("LOG_DIR") or "").strip()
+    if not raw:
+        return ROOT / "logs"
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else (ROOT / path)
+
+
 def _b(key: str, default: bool) -> bool:
     v = (os.environ.get(key) or "").strip().lower()
     if not v:
@@ -114,7 +127,11 @@ class Config:
     save_audio: bool = False
     history_turns: int = 20      # จำนวนข้อความย้อนหลังที่ส่งให้โมเดล
     keep_findings: int = 4       # จำนวนผลค้นเว็บย้อนหลังที่คงไว้ในความจำ
+
+    # --- บันทึกการสนทนา (P3-18) ---
     log_dir: Path = field(default_factory=lambda: ROOT / "logs")
+    log_transcript: bool = True   # False = ไม่เขียนคำพูดลงดิสก์เลย (เก็บแค่ latency)
+    log_retention_days: int = 0   # 0 = ไม่ลบอัตโนมัติ · N = ลบ session ที่เก่ากว่า N วัน
 
     # --- ค้นข้อมูลจากอินเทอร์เน็ต ---
     web_search: bool = True
@@ -188,6 +205,9 @@ def load_config() -> Config:
         reply_max_sentences=_i("REPLY_MAX_SENTENCES", 4),
         reply_max_chars=_i("REPLY_MAX_CHARS", 320),
         keep_findings=_i("KEEP_FINDINGS", 4),
+        log_dir=log_dir(),
+        log_transcript=_b("LOG_TRANSCRIPT", True),
+        log_retention_days=_i("LOG_RETENTION_DAYS", 0),
         web_search=_b("WEB_SEARCH", True),
         search_results=_i("SEARCH_RESULTS", 5),
         search_timeout=_f("SEARCH_TIMEOUT", 12.0),

@@ -61,6 +61,8 @@ class VoiceChat:
         self.log = SessionLogger(
             cfg.log_dir,
             save_audio=cfg.save_audio,
+            transcript=cfg.log_transcript,
+            retention_days=cfg.log_retention_days,
             meta={
                 "chat_model": cfg.chat_model,
                 "asr_model": cfg.asr_model,
@@ -826,7 +828,10 @@ class VoiceChat:
         self.console.clear_status()
         self.console.line()
         self.console.note(f"  บันทึกบทสนทนาไว้ที่ {self.log.dir}")
-        self.console.note(f"    · {self.log.md.name}  (อ่านง่าย)")
+        if self.log.transcript:
+            self.console.note(f"    · {self.log.md.name}  (อ่านง่าย)")
+        else:
+            self.console.note("    · ปิดการเก็บคำพูดไว้ (LOG_TRANSCRIPT=0)")
         self.console.note(f"    · {self.log.jsonl.name}  (เหตุการณ์ + latency)")
         self.console.line()
 
