@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import logging
 import os
 import queue
 import re
@@ -22,9 +23,10 @@ import numpy as np
 
 from vc.api import ApiClient, ApiError
 from vc.audio import Microphone, Speaker, list_devices, mac_input_volume
-from vc.chunker import SentenceChunker, clean_for_tts, split_for_tts
+from vc.chunker import ReplyLimiter, SentenceChunker, clean_for_tts, split_for_tts
 from vc.config import Config, load_config
 from vc.logger import SessionLogger
+from vc.phase import BARGE_IN_PHASES, TurnPhase
 from vc.tools import TOOLS, ToolRunner, describe, wrap_external
 from vc.ui import Console, CYAN, GREEN, GRAY, MAGENTA, YELLOW
 from vc.vad import VoiceGate
@@ -42,6 +44,12 @@ LOW_INPUT_VOLUME = 45      # ต่ำกว่านี้บน macOS ถื�
 # (คำตอบยาวสุดที่เจอในบันทึกจริงใช้เวลาราว 20 วินาที จึงเผื่อไว้ 30)
 TTS_WAIT_TIMEOUT = 30.0
 TTS_WAIT_POLL = 0.03
+# เพดานจำนวนเหตุการณ์ที่รอคิวอยู่ — client ที่ยิงเร็วกว่าที่เราประมวลผลทันต้องไม่
+# ทำให้หน่วยความจำโตไม่จำกัด (P2-11) เกินเพดานจะทิ้งของเก่าสุดทิ้ง
+EVENTS_MAXSIZE = 256
+
+# log เฉพาะการเปลี่ยน phase (AC-5.5) — เปิดดูด้วย logging ระดับ DEBUG
+phase_log = logging.getLogger("voicechat.phase")
 
 
 class VoiceChat:
@@ -65,12 +73,13 @@ class VoiceChat:
         self.messages: list[dict] = [cfg.system_message()]
         # ผลค้นเว็บของเทิร์นก่อน ๆ — เก็บแยกจาก messages เพราะต้องรอดจากการตัดประวัติ
         self.findings: collections.deque[str] = collections.deque(maxlen=cfg.keep_findings)
-        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.events: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=EVENTS_MAXSIZE)
 
         self._state_lock = threading.Lock()
         self.epoch = 0
         self.cancel = threading.Event()
-        self.busy = False               # กำลังคิด/พูด → พูดแทรกได้
+        self._phase = TurnPhase.IDLE    # ดู vc/phase.py — แทนธง busy ตัวเดียวของเดิม
+        self.dropped_events = 0         # เหตุการณ์ที่ถูกทิ้งเพราะคิวเต็ม (P2-11)
         self.utterance_no = 0
         self._barged = False            # เทิร์นล่าสุดถูกตัดเพราะ VAD จับว่ามีคนพูด
         self._last_reply: dict | None = None   # ไว้กู้คืนถ้าที่ตัดไปเป็นเสียงหลอน
@@ -88,6 +97,62 @@ class VoiceChat:
         self.gate: VoiceGate | None = None
         self.running = threading.Event()
         self.running.set()
+
+    # ------------------------------------------------------- สถานะของเทิร์น (P2-5)
+    @property
+    def phase(self) -> TurnPhase:
+        with self._state_lock:
+            return self._phase
+
+    @property
+    def busy(self) -> bool:
+        """ยังอยู่ระหว่างเทิร์นไหม — เหลือไว้เพื่อความเข้ากันได้ของ UI/คำสั่งเดิม
+
+        **ห้ามใช้ค่านี้ตัดสินใจพูดแทรก** ต้องดู `phase` เท่านั้น เพราะ "กำลังถอดเสียง"
+        กับ "กำลังพูด" ต้องได้พฤติกรรมต่างกัน (ดู vc/phase.py)
+        """
+        return self.phase is not TurnPhase.IDLE
+
+    def _set_phase(self, phase: TurnPhase) -> None:
+        """จุดเดียวที่เปลี่ยน phase ได้ — thread-safe และ log ทุกครั้ง"""
+        with self._state_lock:
+            old, self._phase = self._phase, phase
+        if old is not phase:
+            self._on_phase_change(old, phase)
+
+    def _mark_speaking(self, epoch: int) -> None:
+        """เสียงก้อนแรกของเทิร์นถูกส่งออกลำโพงแล้ว → GENERATING เป็น SPEAKING
+
+        เช็ค epoch ด้วย เพราะเสียงของเทิร์นที่ถูกยกเลิกไปแล้วต้องไม่ดึงสถานะกลับ
+        """
+        with self._state_lock:
+            if epoch != self.epoch or self._phase is not TurnPhase.GENERATING:
+                return
+            old, self._phase = self._phase, TurnPhase.SPEAKING
+        self._on_phase_change(old, TurnPhase.SPEAKING)
+
+    def _on_phase_change(self, old: TurnPhase, new: TurnPhase) -> None:
+        """hook สำหรับคลาสลูก (โหมดเว็บส่ง phase ขึ้นไปให้ UI ด้วย)"""
+        phase_log.debug("phase %s→%s (epoch=%d)", old.value, new.value, self.epoch)
+
+    # ------------------------------------------------------------ คิวเหตุการณ์
+    def put_event(self, kind: str, payload: object = None) -> bool:
+        """ใส่เหตุการณ์เข้าคิวแบบมีเพดาน — คิวเต็มให้ทิ้งของเก่าสุด (P2-11)
+
+        คืน False ถ้ามีของถูกทิ้ง เพื่อให้ผู้เรียก log ได้ว่าตามไม่ทัน
+        """
+        dropped = False
+        while True:
+            try:
+                self.events.put_nowait((kind, payload))
+                return not dropped
+            except queue.Full:
+                try:
+                    self.events.get_nowait()
+                except queue.Empty:      # ผู้บริโภคดึงออกไปพร้อมกัน — ลองใส่ใหม่
+                    continue
+                dropped = True
+                self.dropped_events += 1
 
     # ---------------------------------------------------------------- ระบบเสียง
     def start_audio(self) -> None:
@@ -146,15 +211,20 @@ class VoiceChat:
 
     # -------------------------------------------------------- callback จาก VAD
     def _on_speech_start(self) -> None:
-        """ผู้ใช้เริ่มพูด — ถ้า AI กำลังคิดหรือพูดอยู่ ให้หยุดทันที"""
-        with self._state_lock:
-            busy = self.busy
-        if busy:
+        """ผู้ใช้เริ่มพูด — ตัดสินใจตาม phase ของเทิร์น ไม่ใช่ธง busy ตัวเดียว (P2-5)
+
+        ช่วง TRANSCRIBING ห้ามขัดเด็ดขาด: เสียงที่เข้ามาตอนนั้นคือประโยคต่อของ
+        เทิร์นเดียวกัน ถ้าขัดตัวเองตรงนี้ `cancel` จะถูก set ก่อนเข้า `respond()`
+        แล้วเทิร์นจะหายเงียบ ๆ (ผู้ใช้ไม่ได้คำตอบและไม่มี error ให้เห็น)
+        """
+        if self.phase in BARGE_IN_PHASES:
             self._barged = True
             self.interrupt("ผู้ใช้พูดแทรก")
 
     def _on_utterance(self, pcm: np.ndarray) -> None:
-        self.events.put(("utterance", pcm))
+        if not self.put_event("utterance", pcm):
+            self.log.event("event_dropped", kind="utterance",
+                           total=self.dropped_events)
 
     def interrupt(self, reason: str, log_event: bool = True) -> None:
         self.cancel.set()
@@ -214,9 +284,12 @@ class VoiceChat:
                     continue
                 t0 = time.perf_counter()
                 pcm = self.api.synthesize(spoken, self.cfg.speaker_sr)
-                if epoch != self.epoch or self.cancel.is_set():
+                # ไม่เช็ค epoch ตรงนี้แล้ว — การเช็คกับการต่อคิวต้องอยู่ใน lock
+                # เดียวกันของ Speaker ไม่งั้นเธรด VAD แทรก interrupt() ระหว่าง
+                # สองบรรทัดได้ แล้วเสียงของเทิร์นที่ถูกยกเลิกจะเล่นต่อ (P2-12)
+                if not self.speaker.play(pcm, tag=(epoch, seq, text), epoch=epoch):
                     continue
-                self.speaker.play(pcm, tag=(epoch, seq, text))
+                self._mark_speaking(epoch)
                 self.log.event(
                     "tts", epoch=epoch, seq=seq, chars=len(spoken),
                     latency_ms=int((time.perf_counter() - t0) * 1000),
@@ -276,7 +349,7 @@ class VoiceChat:
                 continue
             low = text.lower()
             if low in ("/q", "/quit", "/exit", "ออก"):
-                self.events.put(("quit", None))
+                self.put_event("quit")
                 return
             if low in ("/mute", "/m"):
                 self.cfg.tts_enabled = not self.cfg.tts_enabled
@@ -294,19 +367,29 @@ class VoiceChat:
             if low in ("/help", "/h", "/?"):
                 self.print_help()
                 continue
-            self.events.put(("text", text))
+            self.put_event("text", text)
 
     # ------------------------------------------------------------------- turn
-    def _new_epoch(self) -> int:
+    def _new_epoch(self, phase: TurnPhase = TurnPhase.TRANSCRIBING) -> int:
+        """เปิดเทิร์นใหม่: เลื่อน epoch, ล้าง cancel, ตั้ง phase เริ่มต้นของเทิร์น
+
+        ทั้งสามอย่างต้องเกิดพร้อมกันใน lock เดียว ไม่งั้นเธรด VAD อาจเห็น epoch ใหม่
+        แต่ phase เก่า (หรือกลับกัน) แล้วตัดสินใจพูดแทรกผิดจังหวะ
+        """
         with self._state_lock:
             self.epoch += 1
             self.cancel = threading.Event()
-            self.busy = True
-            return self.epoch
+            old, self._phase = self._phase, phase
+            epoch = self.epoch
+        # เปิดประตูลำโพงให้เฉพาะเสียงของเทิร์นนี้ (fence ของ P2-12 อยู่ใน Speaker)
+        if self.speaker is not None:
+            self.speaker.set_epoch(epoch)
+        if old is not phase:
+            self._on_phase_change(old, phase)
+        return epoch
 
     def _finish_epoch(self) -> None:
-        with self._state_lock:
-            self.busy = False
+        self._set_phase(TurnPhase.IDLE)
 
     def _is_echo_noise(self, text: str, barged: bool) -> bool:
         """ตัดสินว่าเสียงที่เพิ่งจับได้เป็นคนพูดจริง หรือเสียงลำโพงตัวเองย้อนเข้าไมค์
@@ -336,9 +419,44 @@ class VoiceChat:
         self._last_reply = None
 
     def handle_utterance(self, first: np.ndarray) -> None:
-        epoch = self._new_epoch()
+        """หนึ่งเทิร์นเต็ม: ถอดเสียง → ตอบ — ต้องคืนสถานะเป็น IDLE ทุกเส้นทาง
+
+        ทั้งก้อนอยู่ใน try/finally ที่เรียก `_finish_epoch()` เสมอ (AC-6.6) และดัก
+        `Exception` กว้างระดับเทิร์น: เน็ตกระตุกหรือบั๊กในเทิร์นเดียวต้องไม่ล้ม
+        session ทั้งอัน (บั๊กเดิม: `httpx.ConnectError` ทะลุถึง `run()` แล้วปิดเลย)
+        """
+        epoch = self._new_epoch(TurnPhase.TRANSCRIBING)
         cancel = self.cancel
         barged, self._barged = self._barged, False
+        try:
+            user_text = self._transcribe_turn(epoch, first)
+            if user_text is None:
+                return
+            if self._is_echo_noise(user_text, barged):
+                if barged:
+                    self.console.note("  (เสียงที่ตัดจังหวะเป็นเสียงสะท้อน ไม่ใช่คำพูด — "
+                                      "เก็บคำตอบเดิมไว้ให้)")
+                    self.log.event("false_barge_in", epoch=epoch, text=user_text)
+                    self._repair_last_reply()
+                elif user_text:
+                    self.log.event("noise_ignored", epoch=epoch, text=user_text)
+                else:
+                    self.console.note("  (ไม่ได้ยินเสียงพูดชัดเจน ลองพูดอีกครั้งครับ)")
+                return
+            self.respond(epoch, cancel, user_text)
+        except Exception as exc:  # noqa: BLE001 — กันเทิร์นเดียวล้มทั้ง session
+            self.console.clear_status()
+            self.console.error(f"เทิร์นนี้ไม่สำเร็จ: {exc}")
+            self.log.event("turn_error", epoch=epoch, error=repr(exc))
+        finally:
+            self._finish_epoch()
+
+    def _transcribe_turn(self, epoch: int, first: np.ndarray) -> str | None:
+        """ถอดเสียงทุกประโยคของเทิร์นนี้ — คืน None ถ้าถอดไม่สำเร็จ
+
+        ระหว่างถอดเสียงผู้ใช้ยังพูดต่อได้ (phase = TRANSCRIBING จึงไม่นับเป็นการ
+        พูดแทรก) ประโยคที่เข้ามาเพิ่มจะถูกดึงจากคิวมาต่อเป็นข้อความเดียวกัน
+        """
         pcms = [first]
         parts: list[str] = []
         try:
@@ -358,43 +476,46 @@ class VoiceChat:
                     )
                     if text:
                         parts.append(text)
-                # ถ้าผู้ใช้พูดต่อระหว่างถอดเสียง ให้รวมเป็นข้อความเดียว
-                pcms = []
-                while True:
-                    try:
-                        kind, payload = self.events.get_nowait()
-                    except queue.Empty:
-                        break
-                    if kind == "utterance":
-                        pcms.append(payload)  # type: ignore[arg-type]
-                    else:
-                        self.events.put((kind, payload))
-                        break
+                pcms = self._pending_utterances()
                 if not pcms:
                     break
         except ApiError as exc:
+            self.console.clear_status()
             self.console.error(f"ถอดเสียงไม่สำเร็จ: {exc}")
-            self.log.event("asr_error", error=str(exc))
-            self._finish_epoch()
-            return
+            self.log.event("asr_error", epoch=epoch, error=str(exc))
+            return None
+        except Exception as exc:  # noqa: BLE001 — ชนิดอื่นที่หลุดมาจากชั้นล่าง
+            self.console.clear_status()
+            self.console.error(f"ถอดเสียงไม่สำเร็จ: {exc}")
+            self.log.event("asr_error", epoch=epoch, error=repr(exc))
+            return None
 
         self.console.clear_status()
-        user_text = " ".join(parts).strip()
-        if self._is_echo_noise(user_text, barged):
-            if barged:
-                self.console.note("  (เสียงที่ตัดจังหวะเป็นเสียงสะท้อน ไม่ใช่คำพูด — "
-                                  "เก็บคำตอบเดิมไว้ให้)")
-                self.log.event("false_barge_in", epoch=epoch, text=user_text)
-                self._repair_last_reply()
-            elif user_text:
-                self.log.event("noise_ignored", epoch=epoch, text=user_text)
+        return " ".join(parts).strip()
+
+    def _pending_utterances(self) -> list[np.ndarray]:
+        """ดึงเฉพาะเสียงที่รอในคิวออกมา (เหตุการณ์ชนิดอื่นคืนกลับเข้าคิวตามลำดับ)"""
+        pcms: list[np.ndarray] = []
+        while True:
+            try:
+                kind, payload = self.events.get_nowait()
+            except queue.Empty:
+                return pcms
+            if kind == "utterance":
+                pcms.append(payload)  # type: ignore[arg-type]
             else:
-                self.console.note("  (ไม่ได้ยินเสียงพูดชัดเจน ลองพูดอีกครั้งครับ)")
-            self._finish_epoch()
-            return
-        self.respond(epoch, cancel, user_text)
+                self.put_event(kind, payload)
+                return pcms
 
     def respond(self, epoch: int, cancel: threading.Event, user_text: str) -> None:
+        """ตอบหนึ่งเทิร์น — การันตีว่าสถานะกลับเป็น IDLE ทุกเส้นทางที่ออกจากที่นี่"""
+        self._set_phase(TurnPhase.GENERATING)
+        try:
+            self._respond(epoch, cancel, user_text)
+        finally:
+            self._finish_epoch()
+
+    def _respond(self, epoch: int, cancel: threading.Event, user_text: str) -> None:
         self.console.begin("🧑 คุณ", CYAN, role="user")
         self.console.write(user_text)
         self.console.end()
@@ -444,26 +565,49 @@ class VoiceChat:
         if self.tools is not None:
             self.tools.reset()
 
+        # เพดานความยาวคำตอบ บังคับในโค้ด ไม่พึ่ง system prompt อย่างเดียว (P2-15)
+        limiter = ReplyLimiter(self.cfg.reply_max_sentences, self.cfg.reply_max_chars)
+        stream = self.api.chat_stream(
+            self._history(), cancel, tools=use_tools,
+            run_tool=run_tool if self.tools is not None else None,
+            max_rounds=self.cfg.tool_rounds)
+
+        def emit(text: str) -> None:
+            """ส่งข้อความที่ผ่านเพดานแล้วออกทั้งจอและคิวเสียง"""
+            nonlocal full, seq, started, first_token_ms
+            if not text:
+                return
+            if not started:
+                first_token_ms = int((time.perf_counter() - t0) * 1000)
+                self.console.begin("🤖 AI ", GREEN, role="assistant")
+                started = True
+            full += text
+            self.console.write(text)
+            # ทยอยส่ง TTS ระหว่างที่ข้อความยังไหลอยู่ เพื่อให้เริ่มพูดเร็วที่สุด
+            # (แลกกับเสียงเปลี่ยนคนทุกก้อน เพราะ OmniVoice สุ่มเสียงใหม่ทุก request
+            #  พิสูจน์แล้วว่าล็อกไม่ได้ ดู README หัวข้อ "เสียงพูดของ AI")
+            if not self.cfg.tts_single_request:
+                for chunk in chunker.feed(text):
+                    seq += 1
+                    self.enqueue_tts(epoch, seq, chunk)
+
         try:
-            for delta in self.api.chat_stream(
-                    self._history(), cancel, tools=use_tools,
-                    run_tool=run_tool if self.tools is not None else None,
-                    max_rounds=self.cfg.tool_rounds):
+            for delta in stream:
                 if cancel.is_set():
                     break
-                if not started:
-                    first_token_ms = int((time.perf_counter() - t0) * 1000)
-                    self.console.begin("🤖 AI ", GREEN, role="assistant")
-                    started = True
-                full += delta
-                self.console.write(delta)
-                # ทยอยส่ง TTS ระหว่างที่ข้อความยังไหลอยู่ เพื่อให้เริ่มพูดเร็วที่สุด
-                # (แลกกับเสียงเปลี่ยนคนทุกก้อน เพราะ OmniVoice สุ่มเสียงใหม่ทุก request
-                #  พิสูจน์แล้วว่าล็อกไม่ได้ ดู README หัวข้อ "เสียงพูดของ AI")
-                if not self.cfg.tts_single_request:
-                    for chunk in chunker.feed(delta):
-                        seq += 1
-                        self.enqueue_tts(epoch, seq, chunk)
+                passed, capped = limiter.feed(delta)
+                emit(passed)
+                if capped:
+                    # ปิดสตรีมให้สะอาด (ไม่ทิ้ง connection ค้าง ไม่มี chunk หลุดต่อ)
+                    stream.close()
+                    self.console.status("✂️", "ตอบครบตามความยาวที่กำหนดแล้ว", YELLOW)
+                    self.log.event("reply_capped", epoch=epoch, chars=len(full),
+                                   sentences=limiter.sentences,
+                                   max_chars=self.cfg.reply_max_chars,
+                                   max_sentences=self.cfg.reply_max_sentences)
+                    break
+            else:
+                emit(limiter.flush())      # สตรีมจบเอง — ปล่อยส่วนที่ค้างในเพดานออก
             if not cancel.is_set():
                 if self.cfg.tts_single_request:
                     if full.strip() and self.cfg.tts_enabled:
@@ -480,6 +624,8 @@ class VoiceChat:
             error = str(exc)
         except Exception as exc:  # noqa: BLE001
             error = repr(exc)
+        finally:
+            stream.close()          # ปิดสตรีมเสมอ แม้ออกทางข้อผิดพลาด
 
         if error:
             if started:
@@ -487,7 +633,6 @@ class VoiceChat:
             self.console.clear_status()
             self.console.error(f"เรียกโมเดลไม่สำเร็จ: {error}")
             self.log.event("chat_error", epoch=epoch, error=error)
-            self._finish_epoch()
             return
 
         # รอให้พูดจบ (หรือถูกขัด / ถูกสั่งปิด / เกินเพดานเวลา)
@@ -543,7 +688,6 @@ class VoiceChat:
             total_ms=int((time.perf_counter() - t0) * 1000),
             sources=used or None,
         )
-        self._finish_epoch()
 
     def _spoken_since(self, mark: int, epoch: int) -> str:
         assert self.speaker is not None
@@ -593,14 +737,25 @@ class VoiceChat:
         c.line()
 
     def greet(self) -> None:
-        self.console.begin("🤖 AI ", GREEN, role="assistant")
-        self.console.write(GREETING)
-        self.console.end()
-        self.log.turn("assistant", GREETING, epoch=0, greeting=True)
-        self.messages.append({"role": "assistant", "content": GREETING})
-        if self.cfg.tts_enabled:
-            self.enqueue_tts(0, 0, GREETING)
-            self.wait_for_tts(self.cancel)
+        """ทักทายตอนเริ่ม — ต้องอยู่ใต้ epoch จริงและ phase = SPEAKING (P2-5)
+
+        เดิมคำทักทายทำงานนอก `_new_epoch()` จึงพูดแทรกไม่ได้เลย (phase = IDLE →
+        `_on_speech_start()` ไม่สั่งหยุดอะไร) ขัดกับที่โฆษณาไว้ทั้งใน README
+        และในตัวข้อความทักทายเอง
+        """
+        epoch = self._new_epoch(TurnPhase.SPEAKING)
+        cancel = self.cancel
+        try:
+            self.console.begin("🤖 AI ", GREEN, role="assistant")
+            self.console.write(GREETING)
+            self.console.end()
+            self.log.turn("assistant", GREETING, epoch=epoch, greeting=True)
+            self.messages.append({"role": "assistant", "content": GREETING})
+            if self.cfg.tts_enabled:
+                self.enqueue_tts(epoch, 0, GREETING)
+                self.wait_for_tts(cancel)
+        finally:
+            self._finish_epoch()
 
     def start_workers(self) -> None:
         threading.Thread(target=self._tts_worker, name="tts", daemon=True).start()
@@ -609,7 +764,7 @@ class VoiceChat:
     def event_loop(self) -> None:
         """วนรับเหตุการณ์จนกว่าจะสั่งออก — ใช้ร่วมกันทั้งโหมดเทอร์มินัลและโหมดเว็บ"""
         while self.running.is_set():
-            if not self.busy:
+            if self.phase is TurnPhase.IDLE:
                 self.console.status(
                     "🎙", "พูดได้เลย..." if not self.args.no_mic
                     else "พิมพ์ข้อความแล้วกด Enter...")
@@ -622,7 +777,8 @@ class VoiceChat:
             if kind == "utterance":
                 self.handle_utterance(payload)  # type: ignore[arg-type]
             elif kind == "text":
-                epoch = self._new_epoch()
+                # ข้อความพิมพ์ไม่ต้องถอดเสียง — เข้าสู่ช่วงคิดคำตอบได้เลย
+                epoch = self._new_epoch(TurnPhase.GENERATING)
                 self.respond(epoch, self.cancel, str(payload))
 
     def run(self) -> None:

@@ -13,6 +13,7 @@ import numpy as np
 
 from vc.api import ApiClient, ApiError
 from vc.config import Config
+from vc.phase import TurnPhase
 from vc.vad import VoiceGate
 from voice_chat import GREETING, VoiceChat
 
@@ -80,6 +81,11 @@ class WebSession(VoiceChat):
         threading.Thread(target=self._tts_worker, name="tts", daemon=True).start()
 
     # ---------------------------------------------------------------- callbacks
+    def _on_phase_change(self, old: TurnPhase, new: TurnPhase) -> None:
+        """ส่ง phase จริงขึ้นไปให้ UI ด้วย เพื่อไม่ต้องเดาจาก icon ของสถานะ (P2-5)"""
+        super()._on_phase_change(old, new)
+        self.out.json("phase", value=new.value, prev=old.value)
+
     def _on_speech_start(self) -> None:
         self.out.json("speech", state="start")
         super()._on_speech_start()

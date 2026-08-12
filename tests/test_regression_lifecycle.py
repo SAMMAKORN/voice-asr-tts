@@ -1,11 +1,11 @@
 """เทสต์กันบั๊กเก่ากลับมา (regression) — งาน P1-0
 
-สามข้อนี้เขียนขึ้น "ก่อน" การแก้ ทั้งสามจึงต้อง FAIL บนโค้ดเดิม แล้วทยอยเป็น
-GREEN ตามงานที่แก้จริง:
+สามข้อนี้เขียนขึ้น "ก่อน" การแก้ ทั้งสามจึงต้อง FAIL บนโค้ดเดิม และตอนนี้ GREEN
+ครบทั้งสามแล้ว (marker `phase2` ถูกถอดออกเมื่องานที่เกี่ยวข้องเสร็จ):
 
-    test_request_stop_terminates_all_threads      → GREEN เมื่อทำ P1-2
-    test_continued_speech_during_asr_still_answers → GREEN เมื่อทำ P2-5  (marker phase2)
-    test_transcribe_connect_error_does_not_kill_session → GREEN เมื่อทำ P2-6 (marker phase2)
+    test_request_stop_terminates_all_threads            → GREEN ตั้งแต่ P1-2
+    test_continued_speech_during_asr_still_answers       → GREEN เมื่อทำ P2-5
+    test_transcribe_connect_error_does_not_kill_session  → GREEN เมื่อทำ P2-6
 
 ทั้งหมดรันแบบไม่แตะเน็ตและไม่แตะอุปกรณ์เสียงจริง (ApiClient ถูกสวมทับด้วยของปลอม)
 """
@@ -51,23 +51,28 @@ def test_request_stop_terminates_all_threads(web_session) -> None:
         session.enqueue_tts(0, seq, f"ประโยคที่ {seq} ที่ยังไม่ได้พูด")
     time.sleep(0.2)
 
+    tts = next(t for t in threading.enumerate() if t.name == "tts")
+
     session.request_stop()
     held.set()
 
     worker.join(JOIN_TIMEOUT)
+    # AC-2.1 พูดถึง "ทุกเธรดของ session" — เธรด tts ก็ต้องจบด้วย และ invariant
+    # เรื่อง inflight เป็นจริงหลังเธรดนี้จบ (ดู `_tts_worker`) จึงต้องรอให้จบก่อนวัด
+    tts.join(JOIN_TIMEOUT)
     alive = [t.name for t in threading.enumerate()
              if t.name in ("session", "tts") and t.is_alive()]
 
     assert not worker.is_alive(), (
         "เธรด session ยังไม่จบหลัง request_stop() — ลูปรอ TTS วนไม่จบ "
         f"(เธรดที่ยังค้าง: {alive})")
+    assert not tts.is_alive(), f"เธรด tts ยังไม่จบหลัง request_stop() ({alive})"
     assert session._inflight == 0, (      # AC-2.2
         f"ยังมีงาน TTS ค้างนับไว้ inflight={session._inflight}")
     assert session.tts_queue.empty(), "คิว TTS ไม่ถูกล้างตอนปิด session"
 
 
 # ───────────────────────────────────────────────────────────────────────── 2
-@pytest.mark.phase2
 def test_continued_speech_during_asr_still_answers(web_session) -> None:
     """พูดต่ออีกประโยคระหว่างระบบกำลังถอดเสียง → ต้องได้คำตอบ 1 คำตอบ
 
@@ -116,7 +121,6 @@ def test_continued_speech_during_asr_still_answers(web_session) -> None:
 
 
 # ───────────────────────────────────────────────────────────────────────── 3
-@pytest.mark.phase2
 def test_transcribe_connect_error_does_not_kill_session(web_session) -> None:
     """เน็ตกระตุกตอนถอดเสียง → session ต้องอยู่ต่อและพูดเทิร์นถัดไปได้
 
