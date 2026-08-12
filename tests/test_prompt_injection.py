@@ -89,7 +89,8 @@ def test_tool_result_enters_api_payload_wrapped_and_labelled(cfg, runner) -> Non
     seen: list[list[dict]] = []
     rounds = {"n": 0}
 
-    def fake_stream_once(messages, cancel, tools, tool_choice="auto"):
+    # allow_retry เพิ่มมาใน P2-6 (ลองใหม่ได้เฉพาะก่อน token แรก) — ตัวปลอมรับไว้เฉย ๆ
+    def fake_stream_once(messages, cancel, tools, tool_choice="auto", **kw):
         seen.append([dict(m) for m in messages])
         if rounds["n"] == 0:
             rounds["n"] += 1

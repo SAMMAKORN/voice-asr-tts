@@ -72,6 +72,9 @@ class Config:
     tts_model: str = ""
     temperature: float = 0.6
     max_tokens: int = 350
+    # ลองใหม่กี่ครั้งเมื่อเน็ตกระตุก/เจอ 429/5xx (ไม่รวมครั้งแรก) — P2-6
+    http_retry_max: int = 2
+    http_retry_base_ms: int = 300
 
     # --- เสียง ---
     mic_sr: int = 16000          # อัตราสุ่มที่ ASR ต้องการ
@@ -156,6 +159,8 @@ def load_config() -> Config:
         tts_model=os.environ.get("TTS_MODEL") or "",
         temperature=_f("CHAT_TEMPERATURE", 0.6),
         max_tokens=_i("CHAT_MAX_TOKENS", 350),
+        http_retry_max=_i("HTTP_RETRY_MAX", 2),
+        http_retry_base_ms=_i("HTTP_RETRY_BASE_MS", 300),
         mic_gain=_f("MIC_GAIN", 0.0),
         mic_target_noise=_f("MIC_TARGET_NOISE", 0.0035),
         vad_abs_threshold=_f("VAD_ABS_THRESHOLD", 0.012),
