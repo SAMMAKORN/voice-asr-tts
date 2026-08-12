@@ -141,19 +141,23 @@ class WebSession(VoiceChat):
 
     # --------------------------------------------------------------------- run
     def header(self) -> None:
+        """ข้อมูลตั้งต้นที่ส่งให้หน้าเว็บ
+
+        ห้ามใส่ path ในเครื่อง (log_dir) หรือ endpoint ภายในองค์กร (base_url)
+        ลงใน payload นี้ — ทุก client ที่ต่อเข้ามาอ่านได้หมด (P1-1 ข้อ 4)
+        """
         self.out.json(
             "ready",
             chat_model=self.cfg.chat_model,
             asr_model=self.cfg.asr_model,
             tts_model=self.cfg.tts_model,
-            base_url=self.cfg.base_url,
+            api_configured=bool(self.cfg.base_url and self.cfg.api_key),
             mic_sr=self.cfg.mic_sr,
             speaker_sr=self.cfg.speaker_sr,
             frame_ms=self.cfg.frame_ms,
             tts_enabled=self.cfg.tts_enabled,
             echo_guard=self.cfg.echo_guard,
             web_search=self.cfg.web_search,
-            log_dir=str(self.log.dir),
         )
 
     def print_help(self) -> None:

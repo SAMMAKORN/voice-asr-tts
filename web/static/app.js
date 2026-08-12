@@ -7,6 +7,12 @@ const $ = (id) => document.getElementById(id);
 const TOUR_KEY = 'voicelink.tour.v1';
 const THEME_KEY = 'voicelink.theme.v1';
 
+/* token ที่เซิร์ฟเวอร์ฝังมากับหน้าเว็บ (P1-1) — ต้องแนบไปทุกคำขอ
+   ทั้ง WebSocket (?token=) และ /api/* (header X-Session-Token)
+   เว็บอื่นอ่านค่านี้ไม่ได้เพราะติด Same-Origin Policy ของ fetch/XHR */
+const TOKEN = (document.querySelector('meta[name="session-token"]') || {}).content || '';
+const authHeaders = () => (TOKEN ? { 'X-Session-Token': TOKEN } : {});
+
 let CFG = { mic_sr: 16000, speaker_sr: 24000, frame_ms: 20 };
 
 // ───────────────────────────────────────────────────────── สถานะรวม
@@ -358,7 +364,7 @@ function stopPlayback() {
 // ───────────────────────────────────────────────────────── WebSocket
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
@@ -406,7 +412,8 @@ function handleJson(m) {
       controls(true);
       $('btn-start').textContent = '● ทำงานอยู่';
       $('btn-start').disabled = true;
-      addLog(`พร้อมใช้งาน · บันทึกที่ ${m.log_dir}`, 'good');
+      // ไม่แสดง path ของ log แล้ว — เซิร์ฟเวอร์ไม่ส่งออกมาให้ client อีกต่อไป (P1-1)
+      addLog('พร้อมใช้งาน · บันทึกบทสนทนาไว้ที่เครื่องที่รันเซิร์ฟเวอร์', 'good');
       break;
 
     case 'calibrated': {
@@ -633,7 +640,7 @@ $('btn-check').addEventListener('click', async (e) => {
   const wait = row('…', 'ระบบ', 'กำลังเรียก TTS → ASR → LLM ตามลำดับ', '');
   box.appendChild(wait);
   try {
-    const res = await fetch('/api/selftest', { method: 'POST' });
+    const res = await fetch('/api/selftest', { method: 'POST', headers: authHeaders() });
     const data = await res.json();
     box.innerHTML = '';
     for (const s of data.steps) {
@@ -680,7 +687,7 @@ function row(icon, name, detail, ms, ok, model) {
   }
 
   try {
-    const res = await fetch('/api/config');
+    const res = await fetch('/api/config', { headers: authHeaders() });
     const data = await res.json();
     CFG = Object.assign(CFG, data);
     $('chip-llm').textContent = data.chat_model;
