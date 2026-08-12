@@ -155,6 +155,11 @@ class Speaker:
     """เล่นเสียงจากคิว: play() ต่อคิว, stop() ตัดจบทันที (ใช้เวลาถูกพูดขัด)
 
     เก็บ RMS ของเสียงที่เพิ่งเล่นไว้ ให้ VAD ใช้ประเมินเสียงลำโพงที่รั่วเข้าไมค์
+
+    ประตูกันเสียงข้ามเทิร์น (P2-12): ลำโพงจำ epoch ที่กำลังอนุญาตอยู่เอง แล้ว
+    `play(..., epoch=n)` จะเทียบค่าและต่อคิว **ใน lock เดียวกัน** ก้อนที่มาช้า
+    หลังถูกพูดแทรกจึงตกไปเองแบบไม่มีช่องแทรก (เดิมผู้เรียกเช็ค epoch แล้วค่อย
+    เรียก play เป็นสองบรรทัด เธรด VAD สอด `interrupt()` ระหว่างนั้นได้พอดี)
     """
 
     def __init__(self, samplerate: int, device: int | None = None):
@@ -168,6 +173,7 @@ class Speaker:
         self._pos = 0
         self._out_rms: collections.deque[float] = collections.deque([0.0] * 10, maxlen=10)
         self.finished_tags: list[object] = []
+        self._epoch: int | None = None    # None = ปิดประตู (ยังไม่มีเทิร์นที่อนุญาต)
         self._stream: sd.OutputStream | None = None
 
     def start(self) -> int:
@@ -207,20 +213,48 @@ class Speaker:
             out[filled:] = 0
         self._out_rms.append(rms_i16(out[:filled]) if filled else 0.0)
 
-    def play(self, pcm: np.ndarray, tag: object = None) -> None:
+    # ------------------------------------------------------ ประตูกันเสียงข้ามเทิร์น
+    def set_epoch(self, epoch: int) -> None:
+        """เปิดประตูให้เสียงของเทิร์น `epoch` — เสียงที่ค้างจากเทิร์นก่อนถูกทิ้ง"""
+        with self._lock:
+            self._epoch = int(epoch)
+            self._clear()
+
+    @property
+    def epoch(self) -> int | None:
+        with self._lock:
+            return self._epoch
+
+    def _clear(self) -> None:
+        """ล้างคิวและก้อนที่กำลังเล่น — ต้องถือ `_lock` อยู่แล้วก่อนเรียก"""
+        self._queue.clear()
+        self._cur, self._cur_tag = None, None
+        self._pos = 0
+
+    def play(self, pcm: np.ndarray, tag: object = None,
+             epoch: int | None = None) -> bool:
+        """ต่อเสียงเข้าคิว — คืน False ถ้าถูกปฏิเสธเพราะเป็นเสียงของเทิร์นที่จบไปแล้ว
+
+        ส่ง `epoch` มาด้วยเสมอเมื่อเสียงผูกกับเทิร์น (ไม่ส่ง = ข้ามการตรวจ ใช้กับ
+        เสียงที่ไม่เกี่ยวกับเทิร์นใด เช่นในเทสต์/เสียงเตือน)
+        """
         if pcm.size == 0:
-            return
+            return False
         if self.sr != self.src_sr:
             from .api import resample_i16
             pcm = resample_i16(pcm, self.src_sr, self.sr)
+        block = np.ascontiguousarray(pcm, dtype=np.int16)
         with self._lock:
-            self._queue.append((np.ascontiguousarray(pcm, dtype=np.int16), tag))
+            if epoch is not None and epoch != self._epoch:
+                return False
+            self._queue.append((block, tag))
+            return True
 
     def stop(self) -> None:
+        """หยุดเสียงทันทีและปิดประตู — ก้อนที่กำลังสังเคราะห์อยู่จะเข้าคิวไม่ได้อีก"""
         with self._lock:
-            self._queue.clear()
-            self._cur, self._cur_tag = None, None
-            self._pos = 0
+            self._epoch = None
+            self._clear()
 
     def pending(self) -> bool:
         with self._lock:

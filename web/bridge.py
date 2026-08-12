@@ -95,7 +95,11 @@ class WebSpeaker:
     (ต้องรู้ให้แม่นว่าผู้ใช้ได้ยินอะไรไปบ้าง ตอนถูกพูดขัดจะได้บันทึกถูก)
 
     หน้าตาเหมือน vc.audio.Speaker เท่าที่ VoiceChat/VoiceGate ต้องใช้:
-    play / stop / pending / recent_rms / finished_tags
+    play / stop / set_epoch / pending / recent_rms / finished_tags
+
+    มีประตูกัน epoch เหมือนกับ vc.audio.Speaker (P2-12) — การเช็ค epoch กับการ
+    ส่งเสียงออก WebSocket อยู่ใน lock เดียวกัน เสียงของเทิร์นที่ถูกพูดแทรกไปแล้ว
+    จึงไม่มีทางหลุดออกไปถึงเบราว์เซอร์
     """
 
     RMS_TTL = 0.35        # ถ้า client เงียบหายเกินนี้ ถือว่าไม่ได้เล่นเสียงอยู่
@@ -111,29 +115,48 @@ class WebSpeaker:
         self._pending: dict[tuple[int, int], tuple[object, float]] = {}
         self._rms = 0.0
         self._rms_at = 0.0
+        self._epoch: int | None = None      # None = ปิดประตู
 
     def start(self) -> int:
         return self.sr
 
-    # ------------------------------------------------------------ ส่งเสียงออก
-    def play(self, pcm: np.ndarray, tag: object = None) -> None:
-        if pcm.size == 0:
-            return
-        epoch, seq = 0, 0
-        if isinstance(tag, tuple) and len(tag) >= 2:
-            epoch, seq = int(tag[0]), int(tag[1])
-        deadline = time.monotonic() + pcm.size / self.sr + self.LOST_GRACE
+    # ------------------------------------------------------ ประตูกันเสียงข้ามเทิร์น
+    def set_epoch(self, epoch: int) -> None:
         with self._lock:
-            self._pending[(epoch, seq)] = (tag, deadline)
-        header = np.array([epoch, seq], dtype="<u4").tobytes()
-        self.out.binary(header + np.ascontiguousarray(pcm, "<i2").tobytes())
+            self._epoch = int(epoch)
+            self._pending.clear()
+
+    @property
+    def epoch(self) -> int | None:
+        with self._lock:
+            return self._epoch
+
+    # ------------------------------------------------------------ ส่งเสียงออก
+    def play(self, pcm: np.ndarray, tag: object = None,
+             epoch: int | None = None) -> bool:
+        if pcm.size == 0:
+            return False
+        tag_epoch, seq = 0, 0
+        if isinstance(tag, tuple) and len(tag) >= 2:
+            tag_epoch, seq = int(tag[0]), int(tag[1])
+        deadline = time.monotonic() + pcm.size / self.sr + self.LOST_GRACE
+        body = np.ascontiguousarray(pcm, "<i2").tobytes()
+        header = np.array([tag_epoch, seq], dtype="<u4").tobytes()
+        with self._lock:
+            if epoch is not None and epoch != self._epoch:
+                return False
+            self._pending[(tag_epoch, seq)] = (tag, deadline)
+            # ส่งออกในล็อกด้วย เพื่อไม่ให้ stop() ที่มาพร้อมกันแซงลำดับข้อความ
+            self.out.binary(header + body)
+            return True
 
     def stop(self) -> None:
-        """ตัดเสียงที่ค้างอยู่ทั้งหมดทันที (ใช้ตอนถูกพูดขัด)"""
+        """ตัดเสียงที่ค้างอยู่ทั้งหมดทันที (ใช้ตอนถูกพูดขัด) + ปิดประตู"""
         with self._lock:
+            self._epoch = None
             self._pending.clear()
             self._rms = 0.0
-        self.out.json("stop")
+            self.out.json("stop")
 
     def pending(self) -> bool:
         """ยังมีเสียงรออยู่ไหม — ทิ้งก้อนที่ client ไม่รายงานกลับ จะได้ไม่ค้างตลอดกาล"""
