@@ -432,6 +432,48 @@ body {
   padding: 18px 18px 8px;
   scrollbar-width: thin;
   scrollbar-color: var(--thumb) transparent;
+  overflow-anchor: none;      /* เราคุมการเลื่อนเองใน scrollStream() */
+}
+
+/* ปุ่มลอย "↓ ล่าสุด" — โผล่เฉพาะตอนผู้ใช้เลื่อนขึ้นไปอ่านย้อนแล้วมีข้อความใหม่ */
+.jump {
+  position: absolute;
+  inset-inline-end: 18px;
+  bottom: 14px;
+  z-index: 3;
+  min-height: 44px;           /* เป้าแตะขั้นต่ำบนมือถือ */
+  padding: 10px 16px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 45%, transparent);
+  border-radius: 999px;
+  background: var(--panel-solid);
+  box-shadow: var(--shadow-panel);
+  color: var(--cyan);
+  font-family: var(--thai);
+  font-size: 14.5px;
+  cursor: pointer;
+}
+
+.jump[hidden] { display: none; }
+.jump:hover { border-color: var(--cyan); }
+
+/* คั่นเมื่อ session ใหม่ถูกสร้าง — บอกชัดว่า AI ไม่จำข้อความด้านบนแล้ว */
+.reset-mark {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 6px;
+  color: var(--amber);
+  font-family: var(--thai);
+  font-size: 13px;
+  text-align: center;
+}
+
+.reset-mark::before,
+.reset-mark::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: color-mix(in srgb, var(--amber) 35%, transparent);
 }
 
 .stream::-webkit-scrollbar { width: 9px; }
@@ -694,6 +736,47 @@ body {
   flex-wrap: wrap;
 }
 
+/* แถบแจ้งเตือนในตัว dock — ต้องเห็นได้ทุกความกว้างจอ ไม่ผูกกับแผงข้าง (P2-8) */
+.dock-alert {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 0 100%;
+  order: 9;                    /* ไปอยู่ท้าย dock เสมอ ไม่แทรกกลางปุ่ม */
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--red) 55%, transparent);
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  color: var(--text);
+  font-family: var(--thai);
+  font-size: 14.5px;
+  line-height: 1.5;
+}
+
+.dock-alert[hidden] { display: none; }
+
+.dock-alert .ico {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--red);
+  color: var(--bg);
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.dock-alert .msg { flex: 1; min-width: 0; }
+
+.dock-alert .btn {
+  flex: none;
+  min-height: 44px;
+  min-width: 44px;
+  justify-content: center;
+}
+
 /* วงกลมไมค์ + วงแหวนระดับเสียง */
 .orb {
   position: relative;
@@ -728,8 +811,41 @@ body {
 .orb[data-state="speaking"] { color: var(--magenta); border-color: color-mix(in srgb, var(--magenta) 50%, transparent); }
 .orb[data-state="speaking"] .ring .val { stroke: var(--magenta); }
 .orb[data-state="thinking"] { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 45%, transparent); }
+.orb[data-state="thinking"] .ring .val { stroke: var(--amber); }
 .orb[data-state="listening"] { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
 .orb[data-state="listening"] .ring .val { stroke: var(--green); }
+
+/* กำลังค้นเน็ต — ใช้สีม่วงที่ประกาศไว้ในชุดสีแต่เดิมไม่เคยได้ใช้ */
+.orb[data-state="searching"] { color: var(--violet); border-color: color-mix(in srgb, var(--violet) 50%, transparent); }
+.orb[data-state="searching"] .ring .val { stroke: var(--violet); }
+
+/* มีปัญหา — ต้องแยกจาก idle ได้ทั้งด้วยสีและด้วยข้อความข้าง ๆ */
+.orb[data-state="error"] { color: var(--red); border-color: color-mix(in srgb, var(--red) 60%, transparent); }
+.orb[data-state="error"] .ring .val { stroke: var(--red); stroke-dashoffset: 0; }
+
+/* ระหว่างคิด/ค้นเน็ตไม่มีระดับเสียงมาขับวงแหวน จึงหมุนส่วนโค้งให้เห็นว่ายังทำงานอยู่
+   (2-8 วินาทีที่เคยดูเหมือนหน้าค้าง) */
+@keyframes orb-sweep {
+  from { transform: rotate(-90deg); }
+  to   { transform: rotate(270deg); }
+}
+
+.orb[data-state="thinking"] svg.ring,
+.orb[data-state="searching"] svg.ring {
+  animation: orb-sweep 1.5s linear infinite;
+}
+
+.orb[data-state="thinking"] .ring .val,
+.orb[data-state="searching"] .ring .val {
+  stroke-dashoffset: 158;         /* โค้งราว 30% ของวง */
+  transition: none;
+}
+
+/* ปิด motion ตามความต้องการของผู้ใช้ — สถานะยังอ่านได้จากสีและข้อความ */
+@media (prefers-reduced-motion: reduce) {
+  .orb svg.ring { animation: none !important; }
+  .orb .ring .val { transition: none !important; }
+}
 
 .status-text {
   min-width: 210px;
