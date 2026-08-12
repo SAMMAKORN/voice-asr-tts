@@ -27,8 +27,9 @@ if str(ROOT) not in sys.path:
 def _install_sounddevice_stub() -> None:
     """ยัดโมดูล sounddevice ปลอมเข้า sys.modules ถ้าของจริงใช้ไม่ได้
 
-    ``vc.audio`` import sounddevice ตั้งแต่ระดับโมดูล ถ้าเครื่องไม่มี PortAudio
-    จะ OSError ตั้งแต่ import ทำให้เก็บเทสต์ไม่ได้เลย (ไม่ใช่ผลลัพธ์ที่ต้องการ)
+    ตั้งแต่ P3-21 ``vc.audio`` ไม่ import sounddevice ที่ระดับโมดูลแล้ว การเก็บ
+    เทสต์จึงไม่ล้มอีกแม้ไม่มี PortAudio แต่ตัวปลอมยังต้องมีอยู่ เพราะเทสต์ที่เรียก
+    ``Microphone.start()``/``Speaker.start()`` จริงต้องได้อุปกรณ์ปลอมมาใช้
     """
     try:
         import sounddevice  # noqa: F401
