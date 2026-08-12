@@ -85,9 +85,11 @@ class Microphone:
         self.device = device
         self.frames: queue.Queue[np.ndarray] = queue.Queue(maxsize=250)
         self.native_sr = samplerate
-        self.overflows = 0
+        # ตัวเลขคุณภาพเสียงเข้า — สรุปลง log ตอนจบ session (ดู VoiceChat.log_input_stats)
+        self.overflows = 0       # ไดรเวอร์ส่งเฟรมมาเร็วกว่าที่เราอ่านทัน
+        self.dropped = 0         # คิวเต็มจนต้องทิ้งเฟรม (VAD จะไม่ได้ยินช่วงนั้น)
         self.gain = 1.0          # ขยายเสียงฝั่งซอฟต์แวร์ (ดู set_gain)
-        self.clipped = 0
+        self.clipped = 0         # ขยายแล้วชนขอบ 32767 (เสียงเพี้ยน ASR ถอดพลาด)
         self._stream: sd.InputStream | None = None
 
     @property
@@ -143,7 +145,7 @@ class Microphone:
         try:
             self.frames.put_nowait(frame)
         except queue.Full:
-            pass
+            self.dropped += 1
 
     def stop(self) -> None:
         stream, self._stream = self._stream, None
@@ -259,13 +261,6 @@ class Speaker:
     def pending(self) -> bool:
         with self._lock:
             return self._cur is not None or bool(self._queue)
-
-    def queued_seconds(self) -> float:
-        with self._lock:
-            n = sum(a.size for a, _ in self._queue)
-            if self._cur is not None:
-                n += self._cur.size - self._pos
-        return n / self.sr
 
     def recent_rms(self) -> float:
         """RMS สูงสุดใน ~200ms ที่ผ่านมา (ครอบ latency ของเสียงที่วนกลับเข้าไมค์)"""

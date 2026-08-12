@@ -38,7 +38,6 @@ class VoiceGate(threading.Thread):
         self.on_level = on_level
 
         self._stop = threading.Event()
-        self.paused = threading.Event()      # หยุดฟังชั่วคราว (โหมดพิมพ์)
 
         fm = cfg.frame_ms
         self._need_idle = max(1, cfg.vad_confirm_ms // fm)
@@ -80,10 +79,6 @@ class VoiceGate(threading.Thread):
             try:
                 frame = self.mic.frames.get(timeout=0.2)
             except queue.Empty:
-                continue
-            if self.paused.is_set():
-                if self.in_speech:
-                    self._reset()
                 continue
             self._process(frame)
 

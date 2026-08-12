@@ -357,12 +357,3 @@ def host_of(url: str) -> str:
         except (UnicodeError, ValueError):
             pass
     return host
-
-
-def sources(results: list[dict], limit: int = 3) -> str:
-    hosts: list[str] = []
-    for r in results:
-        host = r.get("host") or host_of(r["url"])
-        if host and host not in hosts:
-            hosts.append(host)
-    return ", ".join(hosts[:limit])

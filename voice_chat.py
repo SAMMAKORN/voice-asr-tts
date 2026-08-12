@@ -13,7 +13,6 @@ import collections
 import logging
 import os
 import queue
-import re
 import sys
 import threading
 import time
@@ -25,10 +24,11 @@ from vc.api import ApiClient, ApiError
 from vc.audio import Microphone, Speaker, list_devices, mac_input_volume
 from vc.chunker import ReplyLimiter, SentenceChunker, clean_for_tts, split_for_tts
 from vc.config import Config, load_config
+from vc.echo import noise_reason
 from vc.logger import SessionLogger
 from vc.phase import BARGE_IN_PHASES, TurnPhase
 from vc.tools import TOOLS, ToolRunner, describe, wrap_external
-from vc.ui import Console, CYAN, GREEN, GRAY, MAGENTA, YELLOW
+from vc.ui import Console, CYAN, GREEN, MAGENTA, YELLOW
 from vc.vad import VoiceGate
 
 GREETING = "สวัสดีครับ ผมพร้อมคุยแล้ว พูดได้เลยครับ พูดแทรกได้ตลอดเวลา"
@@ -38,7 +38,6 @@ NO_ANSWER_MARK = "…(ผู้ใช้พูดแทรกก่อนที�
 FINDINGS_HEADER = (
     "ข้อมูลที่คุณค้นเจอไปแล้วก่อนหน้านี้ในบทสนทนาเดียวกัน "
     "ใช้ตอบต่อได้เลยโดยไม่ต้องค้นซ้ำ ถ้าผู้ใช้ถามย้ำเรื่องเดิม:\n\n")
-THAI_CHARS = re.compile(r"[฀-๿]")
 LOW_INPUT_VOLUME = 45      # ต่ำกว่านี้บน macOS ถือว่าไมค์ถูกหรี่จนใช้งานไม่ได้
 # เพดานเวลารอให้ TTS พูดจบต่อหนึ่งเทิร์น — กันลูปรอวนไม่จบถ้ามีอะไรค้างผิดปกติ
 # (คำตอบยาวสุดที่เจอในบันทึกจริงใช้เวลาราว 20 วินาที จึงเผื่อไว้ 30)
@@ -86,6 +85,8 @@ class VoiceChat:
         self.utterance_no = 0
         self._barged = False            # เทิร์นล่าสุดถูกตัดเพราะ VAD จับว่ามีคนพูด
         self._last_reply: dict | None = None   # ไว้กู้คืนถ้าที่ตัดไปเป็นเสียงหลอน
+        self._last_spoken = ""          # ข้อความที่ออกลำโพงไปแล้วจริงในเทิร์นก่อน
+        self.false_barge_ins = 0        # จำนวนครั้งที่ยืนยันว่าไม่ใช่การพูดแทรกจริง
         self.audio_stuck = False        # ปิด stream ไม่ลง (ดู vc.audio.close_stream)
 
         self.tts_queue: queue.Queue[tuple[int, int, str] | None] = queue.Queue()
@@ -394,21 +395,14 @@ class VoiceChat:
     def _finish_epoch(self) -> None:
         self._set_phase(TurnPhase.IDLE)
 
-    def _is_echo_noise(self, text: str, barged: bool) -> bool:
-        """ตัดสินว่าเสียงที่เพิ่งจับได้เป็นคนพูดจริง หรือเสียงลำโพงตัวเองย้อนเข้าไมค์
+    def _noise_reason(self, text: str, barged: bool) -> str | None:
+        """เสียงที่เพิ่งจับได้เป็นคนพูดจริงไหม — คืนเหตุผลถ้าไม่ใช่ (ดู vc/echo.py)
 
-        ตอน AI กำลังพูด เสียงของมันเองรั่วเข้าไมค์เป็นช่วงสั้น ๆ แล้ว ASR จะ
-        "เดา" ออกมาเป็นข้อความมั่ว ๆ มักเป็นภาษาอื่นและสั้น (เจอจริงในบันทึก:
-        啥东西？ / 我爱你。 / bản thân cậu.) ถ้าเชื่อตามนั้นจะได้ผลสองต่อ คือ
-        คำตอบจริงถูกทิ้ง และประวัติสนทนาถูกยัดขยะจนโมเดลตามเรื่องไม่ทัน
+        เทียบกับ `_last_spoken` ซึ่งเป็นข้อความที่ออกลำโพงไปแล้วจริง ไม่ใช่คำตอบเต็ม
+        เพราะเสียงที่วนกลับเข้าไมค์ได้มีแค่ส่วนที่ถูกเล่นออกไปแล้วเท่านั้น
         """
-        t = text.strip()
-        if len(t) < self.cfg.barge_in_min_chars:
-            return True
-        if (barged and len(t) < 40 and self.cfg.lang_hint.startswith("th")
-                and not THAI_CHARS.search(t)):
-            return True
-        return False
+        return noise_reason(text, self._last_spoken, lang_hint=self.cfg.lang_hint,
+                            min_chars=self.cfg.barge_in_min_chars, barged=barged)
 
     def _repair_last_reply(self) -> None:
         """คืนคำตอบเต็มให้ประวัติ หลังพบว่าที่ตัดไปไม่ใช่เสียงคนพูดจริง"""
@@ -435,14 +429,18 @@ class VoiceChat:
             user_text = self._transcribe_turn(epoch, first)
             if user_text is None:
                 return
-            if self._is_echo_noise(user_text, barged):
+            reason = self._noise_reason(user_text, barged)
+            if reason:
                 if barged:
+                    self.false_barge_ins += 1
                     self.console.note("  (เสียงที่ตัดจังหวะเป็นเสียงสะท้อน ไม่ใช่คำพูด — "
                                       "เก็บคำตอบเดิมไว้ให้)")
-                    self.log.event("false_barge_in", epoch=epoch, text=user_text)
+                    self.log.event("false_barge_in", epoch=epoch, text=user_text,
+                                   reason=reason, total=self.false_barge_ins)
                     self._repair_last_reply()
                 elif user_text:
-                    self.log.event("noise_ignored", epoch=epoch, text=user_text)
+                    self.log.event("noise_ignored", epoch=epoch, text=user_text,
+                                   reason=reason)
                 else:
                     self.console.note("  (ไม่ได้ยินเสียงพูดชัดเจน ลองพูดอีกครั้งครับ)")
                 return
@@ -650,6 +648,8 @@ class VoiceChat:
 
         interrupted = cancel.is_set()
         spoken = self._spoken_since(mark, epoch)
+        # เก็บ "สิ่งที่ผู้ใช้ได้ยินจริง" ไว้เทียบกับเสียงที่อาจสะท้อนกลับเข้าไมค์ (P3-23)
+        self._last_spoken = spoken
         if started:
             self.console.end("  ⟨ถูกพูดขัด⟩" if interrupted else "")
         self.console.clear_status()
@@ -748,6 +748,7 @@ class VoiceChat:
         """
         epoch = self._new_epoch(TurnPhase.SPEAKING)
         cancel = self.cancel
+        mark = len(self.speaker.finished_tags) if self.speaker is not None else 0
         try:
             self.console.begin("🤖 AI ", GREEN, role="assistant")
             self.console.write(GREETING)
@@ -757,6 +758,8 @@ class VoiceChat:
             if self.cfg.tts_enabled:
                 self.enqueue_tts(epoch, 0, GREETING)
                 self.wait_for_tts(cancel)
+                # คำทักทายก็สะท้อนเข้าไมค์ได้เหมือนคำตอบปกติ (P3-23)
+                self._last_spoken = self._spoken_since(mark, epoch)
         finally:
             self._finish_epoch()
 
@@ -813,6 +816,30 @@ class VoiceChat:
             except Exception as exc:  # noqa: BLE001
                 print(f"ปิด {name} ไม่สำเร็จ: {exc!r}", file=sys.stderr)
 
+    def log_input_stats(self) -> None:
+        """สรุปตัวเลขคุณภาพเสียงเข้าตอนจบ session (P3-23)
+
+        เดิมนับ `overflows`/`clipped`/`dropped` ไว้แต่ไม่เคยแสดงที่ไหนเลย ทั้งที่เป็น
+        คำตอบตรง ๆ ของ "ทำไมมันไม่ได้ยินที่พูด" — overflow/dropped = เฟรมหาย,
+        clipped = ขยายเสียงมากไปจนเสียงเพี้ยน
+        """
+        mic = self.mic
+        stats = {
+            "overflows": int(getattr(mic, "overflows", 0) or 0),
+            "clipped": int(getattr(mic, "clipped", 0) or 0),
+            "dropped_frames": int(getattr(mic, "dropped", 0) or 0),
+            "dropped_events": self.dropped_events,
+            "false_barge_ins": self.false_barge_ins,
+        }
+        self.log.event("input_stats", **stats)
+        if any(stats.values()):
+            self.console.note(
+                f"  คุณภาพเสียงเข้า: เฟรมล้น {stats['overflows']} · "
+                f"เฟรมถูกทิ้ง {stats['dropped_frames']} · "
+                f"เสียงคลิป {stats['clipped']} · "
+                f"เหตุการณ์ถูกทิ้ง {stats['dropped_events']} · "
+                f"พูดแทรกที่เป็นเสียงสะท้อน {stats['false_barge_ins']} ครั้ง")
+
     def shutdown(self) -> None:
         self.running.clear()
         self.interrupt("ปิดโปรแกรม", log_event=self.busy)
@@ -825,6 +852,7 @@ class VoiceChat:
         if self.audio_stuck:
             self.console.warn("  ปิดอุปกรณ์เสียงไม่ลง (CoreAudio ค้าง) — บังคับออกให้แล้ว")
             self.log.event("audio_close_timeout")
+        self.log_input_stats()      # ต้องอยู่ก่อน close_resources() ไม่งั้นเขียนไม่ลง
         self.close_resources()
         self.console.clear_status()
         self.console.line()

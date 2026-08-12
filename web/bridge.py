@@ -185,9 +185,6 @@ class WebSpeaker:
                 return 0.0
             return self._rms
 
-    def queued_seconds(self) -> float:
-        return 0.0
-
     def close(self) -> None:
         with self._lock:
             self._pending.clear()
