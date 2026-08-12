@@ -9,7 +9,9 @@ import json
 import logging
 import os
 import secrets
+import sys
 import threading
+import traceback
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -177,6 +179,29 @@ async def _pump(ws: WebSocket, out: Outbox) -> None:
             return
 
 
+JOIN_TIMEOUT = 5.0       # วินาทีที่ยอมรอเธรด session ปิดตัว
+
+
+def _thread_stack(thread: threading.Thread) -> str:
+    frames = sys._current_frames().get(thread.ident or -1)
+    if frames is None:
+        return "(ไม่พบ stack ของเธรดนี้)"
+    return "".join(traceback.format_stack(frames))
+
+
+async def close_session(session, worker: threading.Thread) -> None:
+    """ปิด session ให้จบจริง — ถ้า join ไม่สำเร็จต้องดังและต้องไม่ทิ้งทรัพยากรค้าง"""
+    session.request_stop()
+    await asyncio.to_thread(worker.join, JOIN_TIMEOUT)
+    if worker.is_alive():
+        log.error("join timeout: เธรด %r ไม่จบภายใน %.1f วินาที "
+                  "— ปิดทรัพยากรให้เองแทน\n%s",
+                  worker.name, JOIN_TIMEOUT, _thread_stack(worker))
+    # เรียกเสมอ แม้ join สำเร็จ (ซ้ำได้ ไม่มีผลข้างเคียง) เพื่อรับประกันว่า
+    # log.close()/api.close() ถูกเรียกแม้เธรด session จะค้างจน shutdown() ไม่ทำงาน
+    session.close_resources()
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
     # ตรวจสิทธิ์ "ก่อน" accept เสมอ — ถ้า accept ไปแล้วค่อยปิด ผู้โจมตีจะได้
@@ -230,8 +255,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("ws error: %r", exc)
     finally:
-        session.request_stop()
-        await asyncio.to_thread(worker.join, 5.0)
+        await close_session(session, worker)
         out.close()
         await pump
         try:

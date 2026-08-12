@@ -132,9 +132,16 @@ class WebSession(VoiceChat):
             self.request_stop()
 
     def request_stop(self) -> None:
-        """สั่งปิด session จากฝั่ง asyncio (client ตัดการเชื่อมต่อ/กดออก)"""
+        """สั่งปิด session จากฝั่ง asyncio (client ตัดการเชื่อมต่อ/กดออก)
+
+        ลำดับสำคัญ: ต้อง `interrupt()` (ซึ่ง set `cancel`) **ก่อน** เคลียร์ `running`
+        ไม่งั้นเทิร์นที่กำลังรอ TTS อยู่จะไม่รู้ว่าถูกยกเลิก แล้ววนรอต่อไปเรื่อย ๆ
+        จนเธรดค้างตลอดอายุ process (บั๊กเดิม: ปิดแท็บระหว่าง AI พูด = เธรดรั่ว)
+        """
         self._closed.set()
+        self.interrupt("ปิดการเชื่อมต่อ", log_event=False)   # set cancel + หยุดเสียง
         self.running.clear()
+        self._drain_tts_queue()          # งานที่เพิ่งถูกใส่เข้ามาระหว่างปิด
         if self.mic is not None:
             self.mic.started.set()       # ปลดล็อกกรณีค้างรออยู่ตอน calibrate
         self.events.put(("quit", None))

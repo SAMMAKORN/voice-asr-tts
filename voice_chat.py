@@ -16,6 +16,7 @@ import re
 import sys
 import threading
 import time
+from typing import Callable
 
 import numpy as np
 
@@ -37,6 +38,10 @@ FINDINGS_HEADER = (
     "ใช้ตอบต่อได้เลยโดยไม่ต้องค้นซ้ำ ถ้าผู้ใช้ถามย้ำเรื่องเดิม:\n\n")
 THAI_CHARS = re.compile(r"[฀-๿]")
 LOW_INPUT_VOLUME = 45      # ต่ำกว่านี้บน macOS ถือว่าไมค์ถูกหรี่จนใช้งานไม่ได้
+# เพดานเวลารอให้ TTS พูดจบต่อหนึ่งเทิร์น — กันลูปรอวนไม่จบถ้ามีอะไรค้างผิดปกติ
+# (คำตอบยาวสุดที่เจอในบันทึกจริงใช้เวลาราว 20 วินาที จึงเผื่อไว้ 30)
+TTS_WAIT_TIMEOUT = 30.0
+TTS_WAIT_POLL = 0.03
 
 
 class VoiceChat:
@@ -74,6 +79,9 @@ class VoiceChat:
         self.tts_queue: queue.Queue[tuple[int, int, str] | None] = queue.Queue()
         self._inflight = 0
         self._inflight_lock = threading.Lock()
+        self._wait_spins = 0            # นับรอบของลูปรอ TTS (ใช้ยืนยันว่าไม่มี busy-loop)
+        self._close_lock = threading.Lock()
+        self._resources_closed = False
 
         self.mic: Microphone | None = None
         self.speaker: Speaker | None = None
@@ -180,6 +188,16 @@ class VoiceChat:
 
     def _tts_worker(self) -> None:
         assert self.speaker is not None
+        try:
+            self._tts_loop()
+        finally:
+            # ออกจากลูปเมื่อไรก็ตาม ต้องคืนตัวนับให้ครบทุก item ที่ค้างอยู่
+            # ไม่งั้น `_tts_busy()` ค้างเป็น True ตลอดกาลและลูปรอจะไม่มีวันจบ
+            # invariant: หลังเธรดนี้จบ inflight == 0 และคิวว่างเสมอ
+            self._drain_tts_queue()
+
+    def _tts_loop(self) -> None:
+        assert self.speaker is not None
         while self.running.is_set():
             try:
                 item = self.tts_queue.get(timeout=0.2)
@@ -211,6 +229,34 @@ class VoiceChat:
                 self.log.event("tts_error", epoch=epoch, seq=seq, error=repr(exc))
             finally:
                 self._dec_inflight()
+
+    def _tts_pending(self) -> bool:
+        return self._tts_busy() or bool(self.speaker is not None and self.speaker.pending())
+
+    def wait_for_tts(self, cancel: threading.Event | None = None,
+                     on_tick: Callable[[], None] | None = None) -> bool:
+        """รอจนพูดจบ — คืน True ถ้าพูดจบเองตามปกติ
+
+        ทุกเงื่อนไขที่ทำให้ต้องเลิกรอถูกรวมไว้ที่เดียว: ถูกพูดแทรก (`cancel`),
+        ระบบกำลังปิด (`running`) หรือรอเกินเพดานเวลา ก่อนหน้านี้ลูปนี้เช็คแค่
+        `cancel` ซึ่งไม่มีวันเป็น True ตอนปิด session → เธรดค้างและวนกินซีพียู
+        """
+        deadline = time.monotonic() + TTS_WAIT_TIMEOUT
+        while self._tts_pending():
+            if not self.running.is_set():
+                return False
+            if cancel is not None and cancel.is_set():
+                return False
+            if time.monotonic() > deadline:
+                self.console.warn(f"  รอเสียงพูดจบเกิน {TTS_WAIT_TIMEOUT:.0f} วินาที "
+                                  "— ข้ามไปก่อน")
+                self.log.event("tts_wait_timeout", seconds=TTS_WAIT_TIMEOUT)
+                return False
+            self._wait_spins += 1
+            if on_tick is not None:
+                on_tick()
+            time.sleep(TTS_WAIT_POLL)
+        return True
 
     def enqueue_tts(self, epoch: int, seq: int, text: str) -> None:
         if not self.cfg.tts_enabled:
@@ -444,13 +490,15 @@ class VoiceChat:
             self._finish_epoch()
             return
 
-        # รอให้พูดจบ (หรือถูกขัด)
+        # รอให้พูดจบ (หรือถูกขัด / ถูกสั่งปิด / เกินเพดานเวลา)
         if not cancel.is_set() and self.cfg.tts_enabled:
-            while not cancel.is_set() and (self._tts_busy() or self.speaker.pending()):
+            def tick() -> None:
+                assert self.speaker is not None
                 self.console.status(
                     "🔊", "AI กำลังพูด — พูดแทรกได้เลย" if self.speaker.pending()
                     else "กำลังสังเคราะห์เสียง...", GREEN)
-                time.sleep(0.03)
+
+            self.wait_for_tts(cancel, on_tick=tick)
 
         interrupted = cancel.is_set()
         spoken = self._spoken_since(mark, epoch)
@@ -549,8 +597,7 @@ class VoiceChat:
         self.messages.append({"role": "assistant", "content": GREETING})
         if self.cfg.tts_enabled:
             self.enqueue_tts(0, 0, GREETING)
-            while self._tts_busy() or (self.speaker and self.speaker.pending()):
-                time.sleep(0.05)
+            self.wait_for_tts(self.cancel)
 
     def start_workers(self) -> None:
         threading.Thread(target=self._tts_worker, name="tts", daemon=True).start()
@@ -588,6 +635,22 @@ class VoiceChat:
         finally:
             self.shutdown()
 
+    def close_resources(self) -> None:
+        """ปิด log และ HTTP client — เรียกซ้ำได้และห้ามโยน exception ออกไป
+
+        แยกออกมาเพื่อให้ฝั่งเซิร์ฟเวอร์เรียกได้เองเมื่อ join เธรด session ไม่สำเร็จ
+        (ถ้าเธรดค้าง `shutdown()` จะไม่มีวันถูกเรียก แล้วไฟล์บันทึก/คอนเนกชันจะรั่ว)
+        """
+        with self._close_lock:
+            if self._resources_closed:
+                return
+            self._resources_closed = True
+        for name, close in (("log", self.log.close), ("api", self.api.close)):
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001
+                print(f"ปิด {name} ไม่สำเร็จ: {exc!r}", file=sys.stderr)
+
     def shutdown(self) -> None:
         self.running.clear()
         self.interrupt("ปิดโปรแกรม", log_event=self.busy)
@@ -600,8 +663,7 @@ class VoiceChat:
         if self.audio_stuck:
             self.console.warn("  ปิดอุปกรณ์เสียงไม่ลง (CoreAudio ค้าง) — บังคับออกให้แล้ว")
             self.log.event("audio_close_timeout")
-        self.log.close()
-        self.api.close()
+        self.close_resources()
         self.console.clear_status()
         self.console.line()
         self.console.note(f"  บันทึกบทสนทนาไว้ที่ {self.log.dir}")

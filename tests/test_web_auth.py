@@ -34,6 +34,9 @@ class FakeSession:
         self.stopped = True
         self.out.close()
 
+    def close_resources(self) -> None:
+        self.closed = True
+
     def feed_audio(self, data: bytes) -> None: ...
 
     def handle_client(self, msg: dict) -> None: ...
