@@ -223,7 +223,7 @@ class VoiceChat:
 
     def _on_utterance(self, pcm: np.ndarray) -> None:
         if not self.put_event("utterance", pcm):
-            self.log.event("event_dropped", kind="utterance",
+            self.log.event("event_dropped", event="utterance",
                            total=self.dropped_events)
 
     def interrupt(self, reason: str, log_event: bool = True) -> None:

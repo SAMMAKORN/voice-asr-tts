@@ -21,6 +21,40 @@ from .bridge import Outbox, WebConsole, WebMic, WebSpeaker
 
 LEVEL_INTERVAL = 0.1      # ส่งระดับเสียงให้ UI วาดมิเตอร์ ~10 ครั้ง/วินาที
 
+# ─────────────────────────────────────────── เพดาน/ชนิดของข้อความจาก client (P2-11)
+# ไม่มีอะไรที่ client ส่งมาที่เชื่อถือได้ ทุกค่าต้องผ่านการตรวจก่อนใช้เสมอ
+MAX_TEXT_CHARS = 4096         # ข้อความที่พิมพ์แทนการพูด
+MAX_AUDIO_BYTES = 96_000      # ~3 วินาทีที่ 16 kHz/int16 (ปกติเบราว์เซอร์ส่ง 640 ไบต์)
+CLIENT_MESSAGES = frozenset({"played", "level", "text", "interrupt",
+                             "mute", "echo_guard", "clear", "quit"})
+
+
+def _as_int(value: object) -> int | None:
+    """แปลงเป็น int แบบไม่โยน exception — คืน None ถ้าค่าไม่ใช่จำนวนเต็มที่ใช้ได้"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        out = int(value)
+    except (TypeError, ValueError, OverflowError):   # "abc", NaN, inf
+        return None
+    return out if 0 <= out < 1 << 31 else None
+
+
+def _as_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out == out and abs(out) != float("inf") else None   # กัน NaN/inf
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(value)
+
 # เหตุการณ์ที่ส่งต่อให้หน้าเว็บโชว์เป็นตัวเลข latency (ตัวเนื้อความไม่ต้องส่งซ้ำ)
 METRIC_EVENTS = {"asr", "tts", "message", "interrupt", "tool",
                  "asr_error", "tts_error", "chat_error"}
@@ -39,6 +73,7 @@ class WebSession(VoiceChat):
         self.speaker = WebSpeaker(out, cfg.speaker_sr)
         self._level_at = 0.0
         self._closed = threading.Event()
+        self.bad_messages = 0        # ข้อความจาก client ที่ผิดรูปแล้วถูกข้าม (P2-11)
         self._forward_metrics()
 
     def _forward_metrics(self) -> None:
@@ -103,32 +138,77 @@ class WebSession(VoiceChat):
         self.out.json("level", rms=round(level, 4), threshold=round(threshold, 4))
 
     # ------------------------------------------------------- ข้อความจากเบราว์เซอร์
+    def _bad(self, why: str, **fields) -> None:
+        """ข้อความจาก client ผิดรูป — บันทึกแล้วข้ามไป ห้ามปิด session (P2-11)"""
+        self.bad_messages += 1
+        self.log.event("bad_client_message", reason=why,
+                       total=self.bad_messages, **fields)
+
     def feed_audio(self, data: bytes) -> None:
-        assert self.mic is not None
-        if len(data) >= 2:
-            self.mic.feed(np.frombuffer(data, dtype="<i2"))
+        """รับเฟรมเสียงดิบจากเบราว์เซอร์ — ตรวจให้ครบก่อนแปลงเป็น int16
+
+        `np.frombuffer(..., "<i2")` โยน ValueError ทันทีถ้าจำนวนไบต์เป็นเลขคี่
+        ซึ่งเดิมทะลุขึ้นไปถึงลูป transport แล้วปิด session ทั้งอันทิ้ง
+        """
+        if self.mic is None or not data:
+            return
+        if len(data) % 2 or len(data) < 2:
+            self._bad("audio_frame_odd_length", size=len(data))
+            return
+        if len(data) > MAX_AUDIO_BYTES:
+            self._bad("audio_frame_too_large", size=len(data))
+            return
+        try:
+            frame = np.frombuffer(data, dtype="<i2")
+        except (ValueError, TypeError) as exc:
+            self._bad("audio_frame_unreadable", size=len(data), error=repr(exc))
+            return
+        self.mic.feed(frame)
 
     def handle_client(self, msg: dict) -> None:
-        assert self.speaker is not None
+        """ข้อความควบคุมจากเบราว์เซอร์ — ตรวจทีละ field ไม่เชื่อค่าที่ส่งมาเลย"""
+        if self.speaker is None:
+            return
         kind = msg.get("type")
+        if not isinstance(kind, str) or kind not in CLIENT_MESSAGES:
+            self._bad("unknown_type", detail=str(kind)[:40])
+            return
+
         if kind == "played":
-            self.speaker.note_played(int(msg.get("epoch", 0)), int(msg.get("seq", 0)))
+            epoch, seq = _as_int(msg.get("epoch")), _as_int(msg.get("seq"))
+            if epoch is None or seq is None:
+                self._bad("played_bad_ids", epoch=str(msg.get("epoch"))[:40],
+                          seq=str(msg.get("seq"))[:40])
+                return
+            self.speaker.note_played(epoch, seq)
         elif kind == "level":
-            self.speaker.note_level(float(msg.get("out", 0.0)))
+            rms = _as_float(msg.get("out"))
+            if rms is None:
+                self._bad("level_bad_value", out=str(msg.get("out"))[:40])
+                return
+            self.speaker.note_level(rms)
         elif kind == "text":
-            text = str(msg.get("text", "")).strip()
-            if text:
-                self.events.put(("text", text))
+            raw = msg.get("text")
+            if not isinstance(raw, str):
+                self._bad("text_not_a_string", got=type(raw).__name__)
+                return
+            if len(raw) > MAX_TEXT_CHARS:
+                self._bad("text_too_long", chars=len(raw))
+                raw = raw[:MAX_TEXT_CHARS]
+            text = raw.strip()
+            if text and not self.put_event("text", text):
+                self.log.event("event_dropped", event="text",
+                               total=self.dropped_events)
         elif kind == "interrupt":
-            if self.busy:
+            if self.phase is not TurnPhase.IDLE:
                 self.interrupt("ผู้ใช้กดหยุด")
         elif kind == "mute":
-            self.cfg.tts_enabled = not bool(msg.get("on"))
+            self.cfg.tts_enabled = not _as_bool(msg.get("on"))
             if not self.cfg.tts_enabled:
                 self.interrupt("ปิดเสียง", log_event=False)
             self.out.json("setting", key="mute", on=not self.cfg.tts_enabled)
         elif kind == "echo_guard":
-            self.cfg.echo_guard = bool(msg.get("on"))
+            self.cfg.echo_guard = _as_bool(msg.get("on"))
             self.out.json("setting", key="echo_guard", on=self.cfg.echo_guard)
         elif kind == "clear":
             self.reset_history()
@@ -150,7 +230,7 @@ class WebSession(VoiceChat):
         self._drain_tts_queue()          # งานที่เพิ่งถูกใส่เข้ามาระหว่างปิด
         if self.mic is not None:
             self.mic.started.set()       # ปลดล็อกกรณีค้างรออยู่ตอน calibrate
-        self.events.put(("quit", None))
+        self.put_event("quit")           # คิวมีเพดาน — put_event ทิ้งของเก่าให้เอง
 
     # --------------------------------------------------------------------- run
     def header(self) -> None:

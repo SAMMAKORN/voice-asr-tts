@@ -237,9 +237,14 @@ async def ws_endpoint(ws: WebSocket) -> None:
             msg = await ws.receive()
             if msg["type"] == "websocket.disconnect":
                 break
+            # ข้อความเดียวที่ผิดรูปต้องไม่ล้มทั้ง session — session ตรวจ field เองอีกชั้น
+            # (P2-11) ส่วนตรงนี้กันกรณีที่หลุดออกมาถึงชั้น transport จริง ๆ
             data = msg.get("bytes")
             if data:
-                session.feed_audio(data)
+                try:
+                    session.feed_audio(data)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("ข้ามเฟรมเสียงที่ผิดรูป: %r", exc)
                 continue
             text = msg.get("text")
             if not text:
@@ -247,9 +252,14 @@ async def ws_endpoint(ws: WebSocket) -> None:
             try:
                 payload = json.loads(text)
             except json.JSONDecodeError:
+                log.debug("ข้ามข้อความที่ไม่ใช่ JSON (%d ไบต์)", len(text))
                 continue
-            if isinstance(payload, dict):
+            if not isinstance(payload, dict):
+                continue
+            try:
                 session.handle_client(payload)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("ข้ามข้อความควบคุมที่ผิดรูป: %r", exc)
     except WebSocketDisconnect:
         pass
     except Exception as exc:  # noqa: BLE001
