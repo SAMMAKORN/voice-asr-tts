@@ -778,7 +778,7 @@ body {
   font-size: 14px;
 }
 
-.dock-alert .msg { flex: 1; min-width: 0; }
+.dock-alert .text { flex: 1; min-width: 0; }
 
 .dock-alert .btn {
   flex: none;

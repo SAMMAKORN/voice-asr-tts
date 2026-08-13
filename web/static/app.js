@@ -487,7 +487,7 @@ function stopPlayback() {
    ทุกครั้งที่เชื่อมต่อใหม่ เซิร์ฟเวอร์สร้าง WebSession ใหม่ = AI ลืมทุกอย่าง
    จึงต้องแทรกเส้นคั่นบอกให้ชัด ไม่ปล่อยให้ผู้ใช้เข้าใจผิดว่ามันยังจำได้ */
 const RETRY_DELAYS = [500, 1000, 2000, 4000, 8000, 15000];
-const R = { tries: 0, timer: 0, wanted: false };
+const R = { tries: 0, timer: 0, countdown: 0, wanted: false };
 
 function reconnectSoon() {
   if (!R.wanted || R.timer) return;
@@ -504,11 +504,25 @@ function reconnectSoon() {
   const wait = RETRY_DELAYS[R.tries];
   R.tries++;
   setLink('0', 'กำลังเชื่อมต่อใหม่...');
-  setStatus('กำลังเชื่อมต่อใหม่...',
-            `ครั้งที่ ${R.tries} จาก ${RETRY_DELAYS.length} — อีก ${Math.round(wait / 1000)} วินาที`);
   setOrb('thinking');
   addLog(`การเชื่อมต่อหลุด — จะลองใหม่ในอีก ${wait} ms (ครั้งที่ ${R.tries})`, 'warn');
-  R.timer = setTimeout(() => { R.timer = 0; connect(); }, wait);
+
+  // เดิมคำนวณ "อีก N วินาที" ครั้งเดียวตอนตั้งเวลาแล้วไม่อัปเดตอีก จึงค้างเลขเดิม
+  // ไว้ตลอดจนกว่าจะลองเชื่อมต่อจริง ทำให้เลขวินาทีที่เห็นผิดตั้งแต่วินาทีที่สอง
+  const deadline = Date.now() + wait;
+  const tick = () => {
+    const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+    setStatus('กำลังเชื่อมต่อใหม่...',
+              `ครั้งที่ ${R.tries} จาก ${RETRY_DELAYS.length} — อีก ${left} วินาที`);
+  };
+  tick();
+  R.countdown = setInterval(tick, 1000);
+  R.timer = setTimeout(() => {
+    clearInterval(R.countdown);
+    R.countdown = 0;
+    R.timer = 0;
+    connect();
+  }, wait);
 }
 
 function connect() {
