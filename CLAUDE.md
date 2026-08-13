@@ -43,7 +43,7 @@ The suite runs under pytest (`pytest.ini` at the repo root). The default `addopt
 and never launches a browser — safe to run on any change.
 
 ```bash
-pytest                       # the default suite: ~228 tests, no network, no audio device, ~13s
+pytest                       # the default suite: ~233 tests, no network, no audio device, ~13s
 pytest -m unit               # same set, stated explicitly
 pytest -m browser            # 21 Playwright tests against the real frontend (needs chromium)
 pytest -m network            # tests that need live internet (currently none are marked)
@@ -73,10 +73,21 @@ run them just to check a change unless you mean to.
 
 Because the five legacy scripts are outside pytest collection, a rename or deletion in `vc/`
 will not show up as a red test — it shows up only when someone runs the script by hand. Grep them
-whenever you remove a public name from `vc/`.
+whenever you remove a public name from `vc/`. CI runs the three offline ones explicitly for that
+reason.
 
-There is no CI configuration in the repo yet (no `.github/workflows/`); the test suite is run
-locally.
+CI is `.github/workflows/tests.yml` (push + PR): `pip install -r requirements.txt`, `pytest -q`,
+then `test_offline.py` / `test_web.py` / `test_search.py --offline`. It needs no `.env` and no
+credentials. `-m browser`, `-m network`, `test_web_e2e.py` and `test_browser.py` are deliberately
+*not* in CI — see the comment at the bottom of the workflow for why.
+
+Some guard tests read the source tree itself (dead code, naive `datetime.now()`, import
+direction). Always scope those to `(ROOT / folder).rglob("*.py")` for explicit folders, never
+`ROOT.rglob("*.py")`: the repo root picks up an installed `.venv/` (thousands of site-packages
+files, false positives) and evaluates to *nothing at all* under some checkout layouts, which
+passes silently while checking nothing. Assert the file list is non-empty, and prefer `ast` over
+line regexes so a comment or docstring that merely *mentions* the banned call is not reported as
+the violation.
 
 ## Architecture
 

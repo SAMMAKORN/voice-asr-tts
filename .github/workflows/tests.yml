@@ -1,0 +1,48 @@
+# ชุดทดสอบอัตโนมัติ (AC-22.3)
+#
+# ทำไมต้องมี: บั๊กสองรอบล่าสุดของโปรเจกต์นี้เป็นบั๊กที่ "ผ่านบนเครื่องคนเขียน"
+# แต่ไม่ผ่านบนเครื่องเปล่า — `collect_ignore` ปิดบัง import ที่พัง และเทสต์
+# กัน dead code / กัน datetime.now() ที่ผลลัพธ์เปลี่ยนไปตาม path ของ checkout
+# (มี .venv/ = ฟ้องผิด, path มี .claude = ผ่านแบบไม่ตรวจอะไรเลย)
+# การรันบน runner สะอาดทุก push คือสิ่งเดียวที่จับบั๊กแบบนี้ได้
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: ติดตั้ง dependency
+        run: pip install -r requirements.txt
+
+      # ค่าปริยายใน pytest.ini คือ -m "not network and not browser"
+      # จึงไม่ต่ออินเทอร์เน็ต ไม่ต้องมี .env และไม่ต้องมีอุปกรณ์เสียง
+      - name: pytest
+        run: pytest -q
+
+      # สคริปต์รุ่นเดิมสามไฟล์นี้อยู่นอก pytest (tests/conftest.py: collect_ignore)
+      # ถ้าไม่รันตรง ๆ การลบชื่อใน vc/ จะไม่ขึ้นเป็นสีแดงที่ไหนเลย
+      - name: สคริปต์ทดสอบรุ่นเดิม (เฉพาะส่วนที่ไม่ต่อเน็ต)
+        run: |
+          python tests/test_offline.py
+          python tests/test_web.py
+          python tests/test_search.py --offline
+
+      # ไม่รวมไว้ที่นี่โดยเจตนา (ไม่ใช่ข้ามแบบเงียบ ๆ):
+      # * `pytest -m browser` (tests/test_frontend_ui.py) ต้องลง Playwright +
+      #   ดาวน์โหลด Chromium ก่อน (`pip install playwright &&
+      #   playwright install --with-deps chromium`) ตัวเทสต์เองไม่แตะ API จริง
+      #   (มีเซิร์ฟเวอร์ปลอมในไฟล์) แต่ยังไม่เคยรันบน runner Linux จริง
+      #   จึงเว้นไว้ก่อนกันสีแดงหลอก — เปิดใช้เมื่อยืนยันแล้วว่าเสถียร
+      # * tests/test_web_e2e.py, tests/test_browser.py, `pytest -m network`
+      #   ต้องใช้ API_KEY จริงและมีค่าใช้จ่ายต่อการรัน
