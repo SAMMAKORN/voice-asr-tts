@@ -290,7 +290,18 @@ body {
   display: flex;
   align-items: center;
   gap: 11px;
-  margin-inline-end: auto;
+}
+
+/* จัดกลุ่ม chips/ปุ่มธีม/สถานะเชื่อมต่อไว้ด้วยกัน — พอไม่พอที่จะขึ้นบรรทัดเดียว
+   ทั้งกลุ่มจะห่อลงบรรทัดใหม่พร้อมกันและชิดขวา ไม่ใช่ให้ตัวสุดท้ายหลุดไปอยู่
+   บรรทัดใหม่เดี่ยว ๆ ชิดซ้ายใต้โลโก้ */
+.hud-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  margin-inline-start: auto;
 }
 
 .brand .mark {
@@ -314,13 +325,6 @@ body {
   letter-spacing: 0.22em;
   color: var(--cyan);
   text-transform: uppercase;
-}
-
-.brand p {
-  margin: 0;
-  font-size: 13.5px;
-  line-height: 1.45;
-  color: var(--faint);
 }
 
 .chips { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -626,7 +630,7 @@ body {
 }
 
 /* ---------- แผงข้างขวา (telemetry) ---------- */
-.side { display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 14px; min-height: 0; }
+.side { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 14px; min-height: 0; }
 
 .meter-box { padding: 14px 16px 16px; }
 
@@ -980,7 +984,9 @@ body {
   border: 0;
 }
 
-.controls { display: flex; gap: 8px; flex-wrap: wrap; }
+/* ปุ่มควบคุม — บังคับให้ขึ้นบรรทัดใหม่ของตัวเองเสมอ (เหมือนที่ .dock-alert
+   ทำกับ flex:1 0 100%) ไม่ให้ไปแย่งที่แถวบนกับไมค์/ช่องพิมพ์ */
+.controls { display: flex; gap: 8px; flex-wrap: wrap; flex: 1 0 100%; }
 
 /* ช่องพิมพ์ */
 .compose {
@@ -1260,7 +1266,6 @@ kbd {
   .main { grid-template-columns: minmax(0, 1fr); }
   .side { display: none; }
   .shell { padding: 12px 12px 14px; }
-  .brand p { display: none; }
 }
 
 @media (max-width: 620px) {

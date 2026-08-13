@@ -37,23 +37,22 @@
           <path d="M5 12a7 7 0 0 0 14 0"/><path d="M12 19v2"/>
         </svg>
       </span>
-      <div>
-        <h1>Voice&nbsp;Link</h1>
-        <p>เสียง → ถอดเสียง → คิด → พูดกลับ · พูดแทรกได้ตลอดเวลา</p>
+      <h1>Voice&nbsp;Link</h1>
+    </div>
+
+    <div class="hud-right">
+      <div class="chips" id="chips">
+        <span class="chip"><span class="k">LLM</span> <b id="chip-llm">—</b></span>
+        <span class="chip"><span class="k">ASR</span> <b id="chip-asr">—</b></span>
+        <span class="chip"><span class="k">TTS</span> <b id="chip-tts">—</b></span>
       </div>
+
+      <button class="btn ghost" id="btn-theme" title="สลับธีมหน้าจอ" aria-label="สลับธีมหน้าจอ">
+        <span id="theme-icon">🛰️</span> <span id="theme-name">HUD</span>
+      </button>
+
+      <span class="link-state" id="link" data-on=""><i class="dot"></i><span id="link-text">ยังไม่เชื่อมต่อ</span></span>
     </div>
-
-    <div class="chips" id="chips">
-      <span class="chip"><span class="k">LLM</span> <b id="chip-llm">—</b></span>
-      <span class="chip"><span class="k">ASR</span> <b id="chip-asr">—</b></span>
-      <span class="chip"><span class="k">TTS</span> <b id="chip-tts">—</b></span>
-    </div>
-
-    <button class="btn ghost" id="btn-theme" title="สลับธีมหน้าจอ" aria-label="สลับธีมหน้าจอ">
-      <span id="theme-icon">🛰️</span> <span id="theme-name">HUD</span>
-    </button>
-
-    <span class="link-state" id="link" data-on=""><i class="dot"></i><span id="link-text">ยังไม่เชื่อมต่อ</span></span>
   </header>
 
   <!-- ============ กลางจอ ============ -->
@@ -127,6 +126,11 @@
       <div class="hint" id="status-hint">ครั้งแรกเบราว์เซอร์จะถามสิทธิ์ไมค์ — กดอนุญาต</div>
     </div>
 
+    <form class="compose" id="compose">
+      <input id="input" type="text" autocomplete="off" placeholder="พิมพ์แทนการพูดก็ได้ แล้วกด Enter" disabled>
+      <button class="btn" type="submit" id="btn-send" disabled>ส่ง</button>
+    </form>
+
     <div class="controls">
       <button class="btn primary" id="btn-start">เริ่มระบบ</button>
       <button class="btn danger" id="btn-stop" disabled title="หยุด AI ที่กำลังพูด">■ หยุด</button>
@@ -146,11 +150,6 @@
       <span class="msg" id="alert-msg"></span>
       <button class="btn ghost" id="alert-close" type="button" aria-label="ปิดข้อความแจ้งเตือน">✕</button>
     </div>
-
-    <form class="compose" id="compose">
-      <input id="input" type="text" autocomplete="off" placeholder="พิมพ์แทนการพูดก็ได้ แล้วกด Enter" disabled>
-      <button class="btn" type="submit" id="btn-send" disabled>ส่ง</button>
-    </form>
 
     <!-- ช่องประกาศให้ screen reader: เขียนลงที่นี่ "ตอนข้อความจบแล้ว" ครั้งเดียว
          ต่อหนึ่งข้อความ (P3-16 / AC-16.1) ห้ามผูกกับ #stream ที่ต่อทีละ token -->
