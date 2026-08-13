@@ -7,6 +7,12 @@ const $ = (id) => document.getElementById(id);
 const TOUR_KEY = 'voicelink.tour.v1';
 const THEME_KEY = 'voicelink.theme.v1';
 
+/* token ที่เซิร์ฟเวอร์ฝังมากับหน้าเว็บ (P1-1) — ต้องแนบไปทุกคำขอ
+   ทั้ง WebSocket (?token=) และ /api/* (header X-Session-Token)
+   เว็บอื่นอ่านค่านี้ไม่ได้เพราะติด Same-Origin Policy ของ fetch/XHR */
+const TOKEN = (document.querySelector('meta[name="session-token"]') || {}).content || '';
+const authHeaders = () => (TOKEN ? { 'X-Session-Token': TOKEN } : {});
+
 let CFG = { mic_sr: 16000, speaker_sr: 24000, frame_ms: 20 };
 
 // ───────────────────────────────────────────────────────── สถานะรวม
@@ -20,13 +26,19 @@ let ws = null;
 let live = false;             // ต่อ WebSocket และเริ่มสตรีมแล้ว
 let msgEl = null;             // ฟองข้อความที่กำลังสตรีมอยู่
 let turns = 0, interrupts = 0;
+let sessions = 0;             // จำนวน session ที่เซิร์ฟเวอร์สร้างให้ (นับจาก ready)
+let audioBlocked = '';        // เหตุผลที่ใช้ไมค์ไม่ได้เลย (เช่น ไม่ใช่ secure context)
 
 // ตัวนับสำหรับดูสถานะเสียงจริง (ใช้ตอนดีบักและตอนทดสอบอัตโนมัติ)
 const VL = window.__vl = {
   chunks: 0, played: 0, cut: 0, stops: 0, sr: 0,
+  attempts: 0, reconnects: 0, orbWrites: 0,
   playing: () => P.active.size,     // จำนวนก้อนเสียงที่จองคิวเล่นอยู่ตอนนี้
 };
 let thinkAt = 0;              // เวลาที่ AI เริ่มคิด — ใช้วัดว่ากว่าจะเห็นตัวอักษรแรกนานแค่ไหน
+
+const reducedMotion = () => window.matchMedia
+  && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 // ───────────────────────────────────────────────────────── UI พื้นฐาน
 function setLink(state, text) {
@@ -39,12 +51,85 @@ function setStatus(now, hint) {
   if (hint !== undefined) $('status-hint').textContent = hint;
 }
 
+/* ไอคอนสถานะจากเซิร์ฟเวอร์ → สถานะของวงแหวน
+   ค่าที่ไม่รู้จักต้องกลายเป็น 'thinking' ไม่ใช่ 'idle' เพราะ 'idle' แปลว่า
+   "พร้อมฟัง" ซึ่งหลอกผู้ใช้ว่าพูดได้ทั้งที่ระบบกำลังยุ่งอยู่ */
 const ORB_BY_ICON = {
   '🎙': 'idle', '🎚': 'thinking', '📝': 'thinking',
-  '💭': 'thinking', '🔊': 'speaking',
+  '💭': 'thinking', '🔎': 'searching', '🔊': 'speaking', '✂️': 'thinking',
 };
 
-function setOrb(state) { $('orb').dataset.state = state; }
+/* phase จริงจากเซิร์ฟเวอร์ (P2-5) — แม่นกว่าเดาจากไอคอน */
+const ORB_BY_PHASE = {
+  idle: 'idle', transcribing: 'thinking',
+  generating: 'thinking', speaking: 'speaking',
+};
+
+function setOrb(state) {
+  const orb = $('orb');
+  if (orb.dataset.state === state) return;
+  orb.dataset.state = state;
+  // ระหว่างคิด/ค้นเน็ต/ผิดพลาด CSS คุมวงแหวนเอง — เลิกขับด้วยระดับเสียง
+  ORB.driven = state === 'idle' || state === 'listening' || state === 'speaking';
+  if (!ORB.driven) ORB.target = 0;
+}
+
+// ───────────────────────────────────────── วงแหวนระดับเสียงรอบวงกลมไมค์ (P2-7)
+/* markup + CSS ของ #orb-val มีมาตั้งแต่ต้นแต่ไม่มีโค้ดขับเลย (dead markup)
+   ตรงนี้ต่อ event `level` เข้ากับ stroke-dashoffset ผ่าน requestAnimationFrame
+   แล้วหน่วงค่าให้ลื่น (ค่าดิบเข้ามา ~10 ครั้ง/วินาที ถ้าเขียนตรง ๆ จะกระตุก) */
+const ORB = { target: 0, shown: 0, len: 226.2, driven: true, raf: 0 };
+
+function paintOrbRing(value) {
+  const el = $('orb-val');
+  if (!el) return;
+  el.setAttribute('stroke-dashoffset', (ORB.len * (1 - value)).toFixed(1));
+  VL.orbWrites++;
+}
+
+function orbLevel(rms) {
+  ORB.target = Math.max(0, Math.min(1, scale(rms)));
+  if (!ORB.driven) return;
+  if (reducedMotion()) {          // ไม่ต้องหน่วงต่อเนื่อง เขียนครั้งเดียวพอ
+    ORB.shown = ORB.target;
+    paintOrbRing(ORB.shown);
+    return;
+  }
+  startOrbLoop();
+}
+
+function startOrbLoop() {
+  if (ORB.raf) return;
+  const frame = () => {
+    ORB.shown += (ORB.target - ORB.shown) * 0.25;
+    if (ORB.driven) paintOrbRing(ORB.shown);
+    if (Math.abs(ORB.target - ORB.shown) < 0.002 && ORB.target === 0) {
+      ORB.raf = 0;                // นิ่งแล้ว หยุดวนเพื่อไม่กินแบตเปล่า ๆ
+      return;
+    }
+    ORB.raf = requestAnimationFrame(frame);
+  };
+  ORB.raf = requestAnimationFrame(frame);
+}
+
+// ───────────────────────────────────── แจ้งเตือนที่เห็นได้ทุกขนาดจอ (P2-8/P2-14)
+/* แผง error เดิมอยู่ใน .side ซึ่ง CSS ซ่อนทิ้งที่ความกว้าง ≤ 1000px
+   ผู้ใช้มือถือจึงไม่เคยเห็น error จาก backend เลย */
+function showAlert(text, opts) {
+  const box = $('alert');
+  $('alert-msg').textContent = text;
+  box.hidden = false;
+  box.dataset.sticky = (opts && opts.sticky) ? '1' : '0';
+  if (!opts || opts.orb !== false) setOrb('error');
+}
+
+function clearAlert(force) {
+  const box = $('alert');
+  if (box.hidden) return;
+  if (!force && box.dataset.sticky === '1') return;   // เช่น secure context
+  box.hidden = true;
+  $('alert-msg').textContent = '';
+}
 
 function addLog(text, level) {
   const box = $('logs');
@@ -124,9 +209,23 @@ function writeMsg(text) {
   scrollStream();
 }
 
+/* ประกาศให้ screen reader ครั้งเดียวตอนข้อความจบ (P3-16 / AC-16.1)
+   #stream ตั้ง aria-live="off" ไว้ เพราะข้อความต่อทีละ token ถ้าประกาศที่นั่น
+   ผู้ใช้ VoiceOver จะได้ยินย่อหน้าเดิมซ้ำทุกตัวอักษรจนฟังไม่รู้เรื่อง */
+function announce(text) {
+  const box = $('sr-live');
+  if (!box || !text) return;
+  // เขียนค่าเดิมทับค่าเดิม screen reader จะไม่ประกาศ — ล้างก่อนหนึ่งจังหวะ
+  box.textContent = '';
+  setTimeout(() => { box.textContent = text; }, 60);
+}
+
 function endMsg(note) {
   if (!msgEl) return;
   msgEl.classList.remove('live');
+  const said = msgEl.querySelector('.body').textContent.trim();
+  const who = msgEl.dataset.role === 'user' ? 'คุณพูดว่า' : 'AI ตอบว่า';
+  if (said) announce(`${who} ${said}${note ? ` (${note})` : ''}`);
   if (note) {
     const b = document.createElement('span');
     b.className = 'badge';
@@ -139,9 +238,37 @@ function endMsg(note) {
   scrollStream();
 }
 
+// ───────────────────────────────────────── เลื่อนตามแบบเกาะก้น (sticky bottom)
+/* เดิม scrollStream() กระชากลงก้นทุก token ผู้ใช้จึงอ่านย้อนระหว่าง AI พิมพ์ไม่ได้เลย
+   ตอนนี้เลื่อนตามเฉพาะเมื่อผู้ใช้ยังอยู่ใกล้ก้น (≤ 48px) ไม่งั้นขึ้นปุ่ม "↓ ล่าสุด" ให้กด */
+const STICK_PX = 48;
+let stickBottom = true;
+
+function nearBottom() {
+  const s = $('stream');
+  return s.scrollHeight - s.scrollTop - s.clientHeight <= STICK_PX;
+}
+
+function showJump(on) {
+  const btn = $('jump');
+  if (btn) btn.hidden = !on;
+}
+
 function scrollStream() {
   const s = $('stream');
+  if (stickBottom) {
+    s.scrollTop = s.scrollHeight;
+    showJump(false);
+    return;
+  }
+  showJump(true);           // มีข้อความใหม่แต่ผู้ใช้กำลังอ่านย้อนอยู่
+}
+
+function jumpToLatest() {
+  const s = $('stream');
+  stickBottom = true;
   s.scrollTop = s.scrollHeight;
+  showJump(false);
 }
 
 /* แหล่งที่มาของข้อมูลที่ค้นจากเน็ต — ติดใต้คำตอบล่าสุดของ AI */
@@ -356,20 +483,57 @@ function stopPlayback() {
 }
 
 // ───────────────────────────────────────────────────────── WebSocket
+/* เชื่อมต่อใหม่เองแบบ exponential backoff — เดิมหลุดแล้วจบเลย ผู้ใช้ต้องกดปุ่มเอง
+   ทุกครั้งที่เชื่อมต่อใหม่ เซิร์ฟเวอร์สร้าง WebSession ใหม่ = AI ลืมทุกอย่าง
+   จึงต้องแทรกเส้นคั่นบอกให้ชัด ไม่ปล่อยให้ผู้ใช้เข้าใจผิดว่ามันยังจำได้ */
+const RETRY_DELAYS = [500, 1000, 2000, 4000, 8000, 15000];
+const R = { tries: 0, timer: 0, wanted: false };
+
+function reconnectSoon() {
+  if (!R.wanted || R.timer) return;
+  if (R.tries >= RETRY_DELAYS.length) {
+    setLink('0', 'เชื่อมต่อไม่ได้');
+    setStatus('เชื่อมต่อเซิร์ฟเวอร์ไม่ได้',
+              'ลองใหม่อัตโนมัติครบแล้ว — กด “เชื่อมต่อใหม่” เพื่อลองอีกครั้ง');
+    showAlert('เชื่อมต่อเซิร์ฟเวอร์ไม่ได้หลังลองใหม่ '
+              + RETRY_DELAYS.length + ' ครั้ง กดปุ่ม “เชื่อมต่อใหม่” เพื่อลองอีกครั้ง');
+    $('btn-start').disabled = false;
+    $('btn-start').textContent = 'เชื่อมต่อใหม่';
+    return;
+  }
+  const wait = RETRY_DELAYS[R.tries];
+  R.tries++;
+  setLink('0', 'กำลังเชื่อมต่อใหม่...');
+  setStatus('กำลังเชื่อมต่อใหม่...',
+            `ครั้งที่ ${R.tries} จาก ${RETRY_DELAYS.length} — อีก ${Math.round(wait / 1000)} วินาที`);
+  setOrb('thinking');
+  addLog(`การเชื่อมต่อหลุด — จะลองใหม่ในอีก ${wait} ms (ครั้งที่ ${R.tries})`, 'warn');
+  R.timer = setTimeout(() => { R.timer = 0; connect(); }, wait);
+}
+
 function connect() {
+  R.wanted = true;
+  VL.attempts++;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
     live = true;
+    if (R.tries) VL.reconnects++;
+    R.tries = 0;
+    clearAlert();
     setLink('1', 'เชื่อมต่อแล้ว');
     setStatus('กำลังเตรียมระบบ...', 'วัดเสียงรบกวนรอบข้าง อยู่เงียบ ๆ ครู่หนึ่ง');
     outLevelLoop();
   };
 
   ws.onmessage = (ev) => {
-    if (typeof ev.data === 'string') return handleJson(JSON.parse(ev.data));
+    if (typeof ev.data === 'string') {
+      let m = null;
+      try { m = JSON.parse(ev.data); } catch (_) { return; }
+      return handleJson(m);
+    }
     const dv = new DataView(ev.data);
     const epoch = dv.getUint32(0, true);
     const seq = dv.getUint32(4, true);
@@ -379,15 +543,31 @@ function connect() {
   ws.onclose = () => {
     live = false;
     stopPlayback();
-    setLink('0', 'หลุดการเชื่อมต่อ');
-    setStatus('การเชื่อมต่อหลุด', 'กด “เริ่มระบบ” อีกครั้งเพื่อเชื่อมต่อใหม่');
-    setOrb('idle');
     controls(false);
+    setOrb('idle');
+    if (R.wanted) {
+      reconnectSoon();
+      return;
+    }
+    setLink('0', 'หลุดการเชื่อมต่อ');
+    setStatus('การเชื่อมต่อหลุด', 'กด “เชื่อมต่อใหม่” เพื่อเริ่มต่อใหม่');
     $('btn-start').disabled = false;
     $('btn-start').textContent = 'เชื่อมต่อใหม่';
   };
 
   ws.onerror = () => addLog('เชื่อมต่อ WebSocket ไม่สำเร็จ', 'error');
+}
+
+/* เส้นคั่นบอกว่าความจำเริ่มใหม่ — เรียกเมื่อได้ ready ของ session ที่สองขึ้นไป */
+function markMemoryReset() {
+  const s = $('stream');
+  if (!s.children.length || $('empty')) return;
+  const el = document.createElement('div');
+  el.className = 'reset-mark';
+  el.id = 'reset-mark-' + sessions;
+  el.textContent = 'เริ่มบทสนทนาใหม่ (AI ไม่จำข้อความด้านบน)';
+  s.appendChild(el);
+  jumpToLatest();
 }
 
 function send(obj) {
@@ -401,12 +581,21 @@ function handleJson(m) {
       $('chip-llm').textContent = m.chat_model;
       $('chip-asr').textContent = m.asr_model;
       $('chip-tts').textContent = m.tts_model;
-      $('btn-mute').dataset.on = m.tts_enabled ? '0' : '1';
-      $('btn-echo').dataset.on = m.echo_guard ? '1' : '0';
+      // ป้ายปุ่มต้องตรงกับค่าจริงของเซิร์ฟเวอร์ทันที ไม่ต้องรอให้ผู้ใช้กด (P2-13)
+      renderMute(!m.tts_enabled);
+      renderEcho(!!m.echo_guard);
       controls(true);
+      clearAlert();
       $('btn-start').textContent = '● ทำงานอยู่';
       $('btn-start').disabled = true;
-      addLog(`พร้อมใช้งาน · บันทึกที่ ${m.log_dir}`, 'good');
+      sessions++;
+      if (sessions > 1) markMemoryReset();   // session ใหม่ = ความจำเริ่มใหม่ (P2-9)
+      // ไม่แสดง path ของ log แล้ว — เซิร์ฟเวอร์ไม่ส่งออกมาให้ client อีกต่อไป (P1-1)
+      addLog('พร้อมใช้งาน · บันทึกบทสนทนาไว้ที่เครื่องที่รันเซิร์ฟเวอร์', 'good');
+      break;
+
+    case 'phase':
+      setOrb(ORB_BY_PHASE[m.value] || 'thinking');
       break;
 
     case 'calibrated': {
@@ -418,25 +607,33 @@ function handleJson(m) {
     case 'status':
       if (m.text) {
         setStatus(m.text, '');
-        setOrb(ORB_BY_ICON[m.icon] || 'idle');
+        // ไอคอนที่ไม่รู้จัก = ระบบกำลังทำอะไรอยู่แน่ ๆ → 'thinking' ไม่ใช่ 'idle'
+        setOrb(ORB_BY_ICON[m.icon] || 'thinking');
         if (m.icon === '💭') thinkAt = performance.now();
       }
       break;
 
     case 'speech':
-      if (m.state === 'start') { setOrb('listening'); setStatus('กำลังฟังคุณพูด...', ''); }
+      if (m.state === 'start') {
+        clearAlert();          // กลับมาทำงานได้แล้ว — ไม่ปล่อยให้ error ค้างหน้าจอ
+        setOrb('listening');
+        setStatus('กำลังฟังคุณพูด...', '');
+      }
       break;
 
     case 'level': {
       const el = $('meter-fill');
-      el.style.width = (scale(m.rms) * 100).toFixed(1) + '%';
-      $('meter').classList.toggle('hot', m.rms > m.threshold);
-      $('meter-mark').style.insetInlineStart = (scale(m.threshold) * 100).toFixed(1) + '%';
-      $('meter-val').textContent = m.rms.toFixed(3);
+      if (el) {          // แผงข้างถูกซ่อนบนจอเล็ก แต่ element ยังอยู่
+        el.style.width = (scale(m.rms) * 100).toFixed(1) + '%';
+        $('meter').classList.toggle('hot', m.rms > m.threshold);
+        $('meter-mark').style.insetInlineStart = (scale(m.threshold) * 100).toFixed(1) + '%';
+        $('meter-val').textContent = m.rms.toFixed(3);
+      }
+      orbLevel(m.rms);          // วงแหวนรอบวงกลมไมค์ (เดิมไม่มีโค้ดขับเลย)
       break;
     }
 
-    case 'begin':  beginMsg(m.role, m.label); break;
+    case 'begin':  clearAlert(); beginMsg(m.role, m.label); break;
 
     case 'delta':
       // ตัวอักษรแรกของ AI = จุดที่ผู้ใช้เห็นว่ามันเริ่มตอบ (รวมเวลาส่งกลับมาแล้ว)
@@ -458,19 +655,25 @@ function handleJson(m) {
     case 'metric': applyMetric(m); break;
 
     case 'setting':
-      if (m.key === 'mute') $('btn-mute').dataset.on = m.on ? '1' : '0';
-      if (m.key === 'echo_guard') $('btn-echo').dataset.on = m.on ? '1' : '0';
+      if (m.key === 'mute') renderMute(!!m.on);
+      if (m.key === 'echo_guard') renderEcho(!!m.on);
       break;
 
     case 'cleared':
       $('stream').innerHTML = '';
       turns = 0;
       $('turn-count').textContent = '0 ข้อความ';
+      jumpToLatest();
       addLog('ล้างประวัติการสนทนาแล้ว');
       break;
 
     case 'log':
       addLog(m.text, m.level === 'info' ? '' : m.level);
+      // error จาก backend ต้องเห็นได้บนมือถือด้วย ไม่ใช่โผล่แค่ในแผงข้างที่ถูกซ่อน
+      if (m.level === 'error') {
+        showAlert(m.text);
+        setStatus('เกิดข้อผิดพลาด', m.text);
+      }
       break;
 
     case 'closed':
@@ -494,18 +697,107 @@ function applyMetric(m) {
   }
 }
 
+// ─────────────────────────────────── ป้ายปุ่มโหมดเสียง (จุดเดียวที่วาดปุ่ม, P2-13)
+/* ป้ายต้องบอก "โหมดที่กำลังใช้อยู่" ไม่ใช่โหมดที่จะสลับไป และต้องวาดจากที่เดียว
+   ทั้งตอนผู้ใช้กดเองและตอนเซิร์ฟเวอร์แจ้งค่ามา (เดิม event ready/setting แก้แค่
+   dataset.on ไม่แตะ textContent ป้ายจึงไม่ตรงกับค่าจริง) */
+function renderEcho(guardOn) {
+  const btn = $('btn-echo');
+  btn.dataset.on = guardOn ? '1' : '0';
+  btn.setAttribute('aria-pressed', guardOn ? 'true' : 'false');
+  btn.textContent = guardOn ? '🔈 โหมดลำโพง' : '🎧 โหมดหูฟัง';
+  btn.title = guardOn
+    ? 'โหมดลำโพง: กันไมค์ได้ยินเสียง AI เอง — กดเพื่อสลับไปโหมดหูฟัง'
+    : 'โหมดหูฟัง: พูดแทรกไวที่สุด — กดเพื่อสลับไปโหมดลำโพง';
+}
+
+function renderMute(muted) {
+  const btn = $('btn-mute');
+  btn.dataset.on = muted ? '1' : '0';
+  btn.setAttribute('aria-pressed', muted ? 'true' : 'false');
+  btn.textContent = muted ? '🔇 เสียงปิด' : '🔊 เสียงเปิด';
+  btn.title = muted ? 'ตอนนี้ปิดเสียง AI อยู่ — กดเพื่อเปิด'
+                    : 'ตอนนี้เปิดเสียง AI อยู่ — กดเพื่อปิด';
+}
+
+const echoOn = () => $('btn-echo').dataset.on === '1';
+const muted = () => $('btn-mute').dataset.on === '1';
+
+// ───────────────────────────────── ข้อความ error ของไมโครโฟนที่ตรงสาเหตุ (P2-14)
+/* เดิมทุก error ได้ข้อความเดียวกันว่า "ตรวจสิทธิ์ไมค์" ทั้งที่สาเหตุที่พบบ่อยที่สุด
+   คือเปิดผ่าน http://<ip> ซึ่งเบราว์เซอร์ไม่ให้ navigator.mediaDevices เลย */
+const SECURE_HINT = 'ต้องเปิดผ่าน https:// หรือ http://localhost เท่านั้น '
+  + 'เบราว์เซอร์ไม่อนุญาตให้ใช้ไมโครโฟนบนหน้าเว็บที่ไม่ปลอดภัย — '
+  + 'ถ้าต้องใช้จากมือถือ ให้ทำ SSH port-forward มาที่ localhost หรือเปิด HTTPS';
+
+function micErrorText(err) {
+  const name = (err && err.name) || '';
+  switch (name) {
+    case 'NotAllowedError':
+    case 'PermissionDeniedError':
+      return 'เบราว์เซอร์ปฏิเสธสิทธิ์ไมโครโฟน — กดไอคอนกุญแจ/กล้องบนแถบที่อยู่ '
+           + 'แล้วอนุญาตไมโครโฟนสำหรับหน้านี้ จากนั้นลองอีกครั้ง';
+    case 'NotFoundError':
+    case 'DevicesNotFoundError':
+      return 'ไม่พบไมโครโฟนในเครื่อง — เสียบไมค์หรือเลือกอุปกรณ์เข้าใน '
+           + 'ตั้งค่าเสียงของระบบ แล้วลองอีกครั้ง';
+    case 'NotReadableError':
+    case 'TrackStartError':
+      return 'ไมโครโฟนถูกแอปอื่นใช้อยู่ — ปิดแอปที่ใช้ไมค์ (เช่นโปรแกรมประชุม) '
+           + 'แล้วลองอีกครั้ง';
+    case 'SecurityError':
+      return 'เบราว์เซอร์บล็อกการใช้ไมโครโฟนด้วยเหตุผลด้านความปลอดภัย — ' + SECURE_HINT;
+    case 'OverconstrainedError':
+      return 'ไมโครโฟนไม่รองรับรูปแบบเสียงที่ขอ — ลองเปลี่ยนอุปกรณ์เข้า';
+    default:
+      if (!window.isSecureContext) return SECURE_HINT;
+      return 'เปิดไมโครโฟนไม่ได้ (' + (name || 'ไม่ทราบสาเหตุ') + ') '
+           + ((err && err.message) ? err.message : '');
+  }
+}
+
+/* ตรวจตอนโหลดหน้าเลย ไม่ต้องรอให้ผู้ใช้กดปุ่มแล้วเจอ error ที่อ่านไม่รู้เรื่อง */
+function checkAudioSupport() {
+  const canGum = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  if (window.isSecureContext && canGum) return true;
+  audioBlocked = window.isSecureContext
+    ? 'เบราว์เซอร์นี้ไม่รองรับการอัดเสียงจากหน้าเว็บ (ไม่มี getUserMedia)'
+    : SECURE_HINT;
+  showAlert(audioBlocked, { sticky: true });
+  setStatus('ใช้ไมโครโฟนบนหน้านี้ไม่ได้', audioBlocked);
+  for (const id of ['btn-start', 'btn-mic']) {
+    const btn = $(id);
+    if (btn) {
+      btn.disabled = true;
+      btn.title = audioBlocked;
+    }
+  }
+  const state = $('mic-state');
+  if (state) state.textContent = 'ใช้ไม่ได้บนหน้านี้';
+  addLog(audioBlocked, 'error');
+  return false;
+}
+
 // ───────────────────────────────────────────────────────── เริ่ม/หยุดระบบ
 async function start() {
   const btn = $('btn-start');
+  if (audioBlocked) {
+    showAlert(audioBlocked, { sticky: true });
+    return;
+  }
   btn.disabled = true;
   btn.textContent = 'กำลังเริ่ม...';
+  R.tries = 0;                 // กดเองถือว่าเริ่มนับความพยายามใหม่ (P2-9)
   try {
     await ensureAudio();
   } catch (err) {
+    const text = micErrorText(err);
     btn.disabled = false;
     btn.textContent = 'เริ่มระบบ';
-    setStatus('เปิดไมโครโฟนไม่ได้', 'ตรวจสิทธิ์ไมค์ของเบราว์เซอร์แล้วลองใหม่');
-    addLog('ขอสิทธิ์ไมโครโฟนไม่สำเร็จ: ' + err.message, 'error');
+    setStatus('เปิดไมโครโฟนไม่ได้', text);
+    showAlert(text);
+    addLog('ขอสิทธิ์ไมโครโฟนไม่สำเร็จ (' + ((err && err.name) || '?') + '): ' + text,
+           'error');
     return;
   }
   btn.textContent = 'กำลังเชื่อมต่อ...';
@@ -520,24 +812,31 @@ $('btn-stop').addEventListener('click', () => {
   send({ type: 'interrupt' });
 });
 
-$('btn-mute').addEventListener('click', (e) => {
-  const on = e.currentTarget.dataset.on !== '1';   // on = ปิดเสียง
-  e.currentTarget.dataset.on = on ? '1' : '0';
-  e.currentTarget.textContent = on ? '🔇 ปิดเสียง' : '🔊 เสียง';
-  if (on) stopPlayback();
-  send({ type: 'mute', on });
+$('btn-mute').addEventListener('click', () => {
+  const next = !muted();                 // next = ปิดเสียง
+  renderMute(next);
+  if (next) stopPlayback();
+  send({ type: 'mute', on: next });
 });
 
-$('btn-echo').addEventListener('click', (e) => {
-  const on = e.currentTarget.dataset.on !== '1';
-  e.currentTarget.dataset.on = on ? '1' : '0';
-  send({ type: 'echo_guard', on });
-  addLog(on ? 'เปิดระบบกันเสียงลำโพงย้อนเข้าไมค์ (โหมดลำโพง)'
-            : 'ปิดระบบกันเสียงลำโพง — พูดแทรกไวสุด (โหมดหูฟัง)');
+$('btn-echo').addEventListener('click', () => {
+  const next = !echoOn();                // next = เปิดโหมดลำโพง (echo guard)
+  renderEcho(next);
+  send({ type: 'echo_guard', on: next });
+  addLog(next ? 'สลับเป็นโหมดลำโพง — กันเสียงลำโพงย้อนเข้าไมค์'
+              : 'สลับเป็นโหมดหูฟัง — พูดแทรกไวที่สุด');
 });
 
 $('btn-clear').addEventListener('click', () => send({ type: 'clear' }));
 $('btn-help').addEventListener('click', () => openTour(0));
+$('jump').addEventListener('click', jumpToLatest);
+$('alert-close').addEventListener('click', () => clearAlert(true));
+
+/* ผู้ใช้เลื่อนเอง = ตัดสินว่ายังอยากเกาะก้นอยู่ไหม (P2-10) */
+$('stream').addEventListener('scroll', () => {
+  stickBottom = nearBottom();
+  if (stickBottom) showJump(false);
+}, { passive: true });
 
 // กดเองแล้วถือว่า “เลือกเอง” — จำค่าไว้และเลิกตามธีมของระบบ
 $('btn-theme').addEventListener('click', () => {
@@ -579,15 +878,36 @@ function showStep(n) {
   renderSteps();
 }
 
+/* คู่มือเป็น <dialog> จริง (P3-16): focus trap, background inert, ปิดด้วย Esc
+   และการคืนโฟกัสให้ปุ่มที่เปิดโมดัล เป็นหน้าที่ของเบราว์เซอร์ ไม่ต้องเขียนเลียนแบบ
+   (เบราว์เซอร์เก่าที่ไม่มี showModal ยังใช้ได้แบบ overlay ธรรมดา) */
+function markTourSeen() {
+  try { localStorage.setItem(TOUR_KEY, '1'); } catch (_) { /* localStorage ถูกปิด */ }
+}
+
+function tourIsOpen() {
+  const d = $('overlay');
+  return typeof d.showModal === 'function' ? d.open : !d.hidden;
+}
+
 function openTour(n) {
-  $('overlay').hidden = false;
+  const d = $('overlay');
+  d.hidden = false;
+  if (typeof d.showModal === 'function' && !d.open) d.showModal();
   showStep(n || 0);
 }
 
 function closeTour() {
-  $('overlay').hidden = true;
-  localStorage.setItem(TOUR_KEY, '1');
+  const d = $('overlay');
+  if (typeof d.close === 'function' && d.open) {
+    d.close();          // เหตุการณ์ 'close' ด้านล่างเป็นคนจำว่าดูคู่มือแล้ว
+    return;
+  }
+  d.hidden = true;
+  markTourSeen();
 }
+
+$('overlay').addEventListener('close', markTourSeen);
 
 $('tour-prev').addEventListener('click', () => showStep(step - 1));
 
@@ -602,13 +922,21 @@ $('tour-next').addEventListener('click', () => {
 
 $('tour-skip').addEventListener('click', closeTour);
 
+/* <dialog> ปิดด้วย Esc ให้เองอยู่แล้ว — เส้นทางนี้ไว้เผื่อเบราว์เซอร์ที่ไม่รองรับ */
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !$('overlay').hidden) closeTour();
+  if (e.key !== 'Escape') return;
+  if (typeof $('overlay').showModal === 'function') return;
+  if (tourIsOpen()) closeTour();
 });
 
 // ขั้นที่ 1 — ขอสิทธิ์ไมค์
 $('btn-mic').addEventListener('click', async (e) => {
   const btn = e.currentTarget;
+  if (audioBlocked) {
+    $('mic-state').textContent = 'ใช้ไม่ได้บนหน้านี้';
+    showAlert(audioBlocked, { sticky: true });
+    return;
+  }
   btn.disabled = true;
   btn.textContent = 'กำลังขอสิทธิ์...';
   try {
@@ -616,10 +944,13 @@ $('btn-mic').addEventListener('click', async (e) => {
     $('mic-state').textContent = 'เปิดแล้ว · ลองพูดดู';
     btn.textContent = '✓ ไมโครโฟนพร้อม';
   } catch (err) {
+    const text = micErrorText(err);
     btn.disabled = false;
     btn.textContent = 'ลองอีกครั้ง';
-    $('mic-state').textContent = 'ไม่ได้รับสิทธิ์';
-    addLog('ขอสิทธิ์ไมโครโฟนไม่สำเร็จ: ' + err.message, 'error');
+    $('mic-state').textContent = 'เปิดไมค์ไม่ได้';
+    $('mic-why').textContent = text;
+    addLog('ขอสิทธิ์ไมโครโฟนไม่สำเร็จ (' + ((err && err.name) || '?') + '): ' + text,
+           'error');
   }
 });
 
@@ -633,7 +964,7 @@ $('btn-check').addEventListener('click', async (e) => {
   const wait = row('…', 'ระบบ', 'กำลังเรียก TTS → ASR → LLM ตามลำดับ', '');
   box.appendChild(wait);
   try {
-    const res = await fetch('/api/selftest', { method: 'POST' });
+    const res = await fetch('/api/selftest', { method: 'POST', headers: authHeaders() });
     const data = await res.json();
     box.innerHTML = '';
     for (const s of data.steps) {
@@ -669,6 +1000,10 @@ function row(icon, name, detail, ms, ok, model) {
   // (ห้ามเรียก applyTheme ตอนเริ่ม ไม่งั้นค่าที่ผู้ใช้เลือกไว้จะถูกเขียนทับ)
   syncThemeButton();
   refreshWaveColors();               // drawWave ถูกเรียกทีหลัง จึงต้องมีสีไว้ก่อน
+  renderMute(muted());               // ป้ายปุ่มมาจากฟังก์ชันเดียวตั้งแต่เฟรมแรก
+  renderEcho(echoOn());
+  paintOrbRing(0);                   // วงแหวนเริ่มที่ศูนย์ (ไม่ใช่ค่าคงในไฟล์ HTML)
+  checkAudioSupport();               // แจ้งเรื่อง secure context ก่อนผู้ใช้กดปุ่ม
 
   // ยังไม่เคยเลือกเอง → เปลี่ยนตามธีมของระบบ (ไม่บันทึกลง localStorage)
   const mq = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)');
@@ -680,7 +1015,7 @@ function row(icon, name, detail, ms, ok, model) {
   }
 
   try {
-    const res = await fetch('/api/config');
+    const res = await fetch('/api/config', { headers: authHeaders() });
     const data = await res.json();
     CFG = Object.assign(CFG, data);
     $('chip-llm').textContent = data.chat_model;
@@ -690,9 +1025,7 @@ function row(icon, name, detail, ms, ok, model) {
     addLog('อ่านค่าตั้งจากเซิร์ฟเวอร์ไม่ได้', 'warn');
   }
 
-  if (localStorage.getItem(TOUR_KEY)) {
-    $('overlay').hidden = true;
-  } else {
-    openTour(0);
-  }
+  let seen = false;
+  try { seen = !!localStorage.getItem(TOUR_KEY); } catch (_) { /* localStorage ถูกปิด */ }
+  if (!seen) openTour(0);            // <dialog> ที่ยังไม่ open ถูกซ่อนอยู่แล้ว
 })();

@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
+<!-- เซิร์ฟเวอร์แทนค่านี้ด้วย session token ตอนเสิร์ฟหน้า (web/server.py) -->
+<meta name="session-token" content="__SESSION_TOKEN__">
 <title>VOICE LINK · คุยกับ AI ด้วยเสียง</title>
 <script>
 /* เลือกธีมก่อน paint แรก — ไม่ให้หน้าจอกระพริบธีมผิดตอนโหลด
@@ -63,7 +65,10 @@
         <span class="spacer"></span>
         <span id="turn-count">0 ข้อความ</span>
       </div>
-      <div class="stream" id="stream">
+      <!-- aria-live="off" ตั้งใจ (P3-16): ข้อความต่อทีละ token ถ้าประกาศที่นี่
+           screen reader จะอ่านซ้ำทั้งย่อหน้าทุกตัวอักษร — ประกาศตอนจบข้อความ
+           ผ่าน #sr-live ด้านล่างแทน -->
+      <div class="stream" id="stream" aria-live="off">
         <div class="empty" id="empty">
           <span class="ring" aria-hidden="true">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
@@ -74,6 +79,8 @@
           <div>ยังไม่มีบทสนทนา<br><small>กด “เริ่มระบบ” แล้วพูดได้เลย</small></div>
         </div>
       </div>
+      <!-- ปุ่มลอย: โผล่เมื่อผู้ใช้เลื่อนขึ้นไปอ่านย้อน แล้วมีข้อความใหม่เข้ามา -->
+      <button class="jump" id="jump" hidden>↓ ล่าสุด</button>
     </section>
 
     <aside class="side">
@@ -93,8 +100,9 @@
       </div>
 
       <div class="panel" style="min-height:0">
-        <div class="panel-head"><span>บันทึกระบบ</span></div>
-        <div class="logs" id="logs"></div>
+        <div class="panel-head"><span id="logs-label">บันทึกระบบ</span></div>
+        <div class="logs" id="logs" role="log" aria-live="polite"
+             aria-labelledby="logs-label"></div>
       </div>
     </aside>
   </div>
@@ -113,7 +121,8 @@
       </svg>
     </div>
 
-    <div class="status-text">
+    <!-- สถานะปัจจุบันเปลี่ยนเป็นก้อน ไม่ใช่ทีละตัวอักษร จึงประกาศตรงนี้ได้ (P3-16) -->
+    <div class="status-text" role="status" aria-live="polite" aria-atomic="true">
       <div class="now" id="status-now">กด “เริ่มระบบ” เพื่อเปิดไมโครโฟน</div>
       <div class="hint" id="status-hint">ครั้งแรกเบราว์เซอร์จะถามสิทธิ์ไมค์ — กดอนุญาต</div>
     </div>
@@ -121,24 +130,36 @@
     <div class="controls">
       <button class="btn primary" id="btn-start">เริ่มระบบ</button>
       <button class="btn danger" id="btn-stop" disabled title="หยุด AI ที่กำลังพูด">■ หยุด</button>
-      <button class="btn" id="btn-mute" data-on="0" disabled title="ปิด/เปิดเสียงพูดของ AI">🔊 เสียง</button>
-      <button class="btn" id="btn-echo" data-on="0" disabled title="เปิดเมื่อใช้ลำโพงดังแล้วไมค์ได้ยินเสียง AI ตัวเอง">🎧 หูฟัง</button>
+      <button class="btn" id="btn-mute" data-on="0" aria-pressed="false" disabled title="ปิด/เปิดเสียงพูดของ AI">🔊 เสียงเปิด</button>
+      <!-- ป้ายบอก "โหมดที่กำลังใช้อยู่" ไม่ใช่โหมดที่จะสลับไป (P2-13) -->
+      <button class="btn" id="btn-echo" data-on="0" aria-pressed="false" title="สลับระหว่างโหมดลำโพง (กันไมค์ได้ยินเสียง AI) กับโหมดหูฟัง (พูดแทรกไวสุด)" disabled>🎧 โหมดหูฟัง</button>
       <button class="btn" id="btn-clear" disabled title="ล้างประวัติการสนทนา">🧹 ล้าง</button>
       <button class="btn ghost" id="btn-help" title="เปิดคู่มือการใช้งาน">? วิธีใช้</button>
+    </div>
+
+    <!-- แผงแจ้งเตือนในตัว dock: ต้องอยู่นอก .side เพราะ .side ถูกซ่อนบนจอเล็ก (P2-8) -->
+    <div class="dock-alert" id="alert" role="alert" hidden>
+      <span class="ico" aria-hidden="true">!</span>
+      <span class="msg" id="alert-msg"></span>
+      <button class="btn ghost" id="alert-close" type="button" aria-label="ปิดข้อความแจ้งเตือน">✕</button>
     </div>
 
     <form class="compose" id="compose">
       <input id="input" type="text" autocomplete="off" placeholder="พิมพ์แทนการพูดก็ได้ แล้วกด Enter" disabled>
       <button class="btn" type="submit" id="btn-send" disabled>ส่ง</button>
     </form>
+
+    <!-- ช่องประกาศให้ screen reader: เขียนลงที่นี่ "ตอนข้อความจบแล้ว" ครั้งเดียว
+         ต่อหนึ่งข้อความ (P3-16 / AC-16.1) ห้ามผูกกับ #stream ที่ต่อทีละ token -->
+    <p class="sr-only" id="sr-live" role="status" aria-live="polite" aria-atomic="true"></p>
   </footer>
 </div>
 
 <!-- ============ Onboarding ============ -->
-<div class="overlay" id="overlay">
-  <div class="tour" role="dialog" aria-modal="true" aria-labelledby="tour-title">
+<dialog class="overlay" id="overlay" aria-labelledby="tour-label">
+  <div class="tour">
     <div class="tour-head">
-      <span>คู่มือเริ่มต้น</span>
+      <span id="tour-label">คู่มือเริ่มต้น</span>
       <span class="steps" id="tour-steps"></span>
     </div>
 
@@ -174,6 +195,7 @@
         <div class="mic-test">
           <div class="cap"><span>ทดสอบระดับเสียง</span><span id="mic-state">ยังไม่เปิด</span></div>
           <div class="meter"><div class="fill" id="mic-fill"></div></div>
+          <p id="mic-why" style="margin:9px 0 0;font-size:12.5px;color:var(--red)" role="status"></p>
           <p style="margin:11px 0 0;font-size:12.5px;color:var(--faint)">
             ลองพูดดู แถบควรขยับตามเสียง ถ้านิ่งสนิทให้เช็กว่าเลือกไมค์ถูกตัวใน System&nbsp;Settings
           </p>
@@ -221,8 +243,9 @@
         <ul>
           <li>ระหว่าง AI พูด ถ้าคุณเริ่มพูด ระบบจะ<b>ตัดเสียงทิ้งทันที</b>แล้วหันมาฟังคุณ</li>
           <li>AI จะจำว่า<b>พูดค้างไว้แค่ไหน</b> จึงไม่พูดซ้ำท่อนที่คุณยังไม่ได้ยิน</li>
-          <li>ปุ่ม <b>■ หยุด</b> สั่งหยุดด้วยมือ · <b>🔊 เสียง</b> ปิดเสียงเหลือแต่ข้อความ</li>
-          <li>ปุ่ม <b>🎧 หูฟัง</b> เปิดเมื่อใช้<b>ลำโพงดัง</b>แล้วไมค์เผลอได้ยินเสียง AI เอง</li>
+          <li>ปุ่ม <b>■ หยุด</b> สั่งหยุดด้วยมือ · <b>🔊 เสียงเปิด</b> ปิดเสียงเหลือแต่ข้อความ</li>
+          <li>ปุ่มโหมดเสียงบอกโหมดที่<b>กำลังใช้อยู่</b> — <b>🔈 โหมดลำโพง</b> กันไมค์ได้ยินเสียง AI เอง
+              (ใช้เมื่อเปิดลำโพงดัง) · <b>🎧 โหมดหูฟัง</b> พูดแทรกไวที่สุด กดที่ปุ่มเพื่อสลับ</li>
           <li>ปุ่ม <b>🧹 ล้าง</b> ล้างความจำการสนทนา เริ่มเรื่องใหม่</li>
           <li>ปุ่มธีมมุมขวาบนสลับหน้าตาได้สองแบบ — <b>🛰️ HUD</b> โทนมืด กับ <b>🧸 ดินน้ำมัน</b> โทนสว่าง ระบบจำที่เลือกไว้ให้</li>
         </ul>
@@ -240,7 +263,7 @@
       <button class="btn primary" id="tour-next">ถัดไป</button>
     </div>
   </div>
-</div>
+</dialog>
 
 <script src="/static/app.js"></script>
 </body>

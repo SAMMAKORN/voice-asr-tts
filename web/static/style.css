@@ -76,7 +76,10 @@
   --shadow-soft: none;
 
   /* เงา/แสงเฉพาะจุด */
-  --focus: 0 0 0 3px color-mix(in srgb, var(--cyan) 8%, transparent);
+  /* วงโฟกัสคีย์บอร์ด (P3-16): วงในสีพื้นคั่นก่อน แล้วค่อยวงนอกสี accent
+     เพื่อให้เห็นชัดบนทุกพื้นหลัง — เดิมเป็น cyan จาง 8% ได้ contrast 1.14:1
+     (คือมองไม่เห็นเลย) ค่าใหม่วัดได้ 14.1:1 บนธีมนี้ */
+  --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--cyan);
   --mark-glow: 0 0 18px color-mix(in srgb, var(--cyan) 25%, transparent) inset;
   --orb-bg: radial-gradient(circle at 50% 35%,
               color-mix(in srgb, var(--teal) 22%, transparent), transparent 65%);
@@ -130,7 +133,9 @@
 
   --text: #4b3f4a;           /* 9.60 */
   --dim: #7a6a76;            /* 4.88 */
-  --faint: #8c7c88;          /* 3.78 — เข้มกว่าพาสเทลเพื่อให้ยังอ่านออก */
+  /* 5.15 บนแผง #fffaf6 · 4.64 บนพื้น #f3ebe6 · 4.51 บน #ece4f0 — ผ่าน AA ทุกพื้น
+     (ค่าเดิม #8c7c88 วัดได้ 3.16-3.78 ตกเกณฑ์ทั้งสามจุดที่ใช้จริง) */
+  --faint: #6a5b64;
 
   /* ฟอนต์ทรงกลมมาก่อน แล้วค่อยไล่ลงตาม stack เดิม */
   --thai: "Noto Sans Thai Looped", "Sukhumvit Set", "IBM Plex Sans Thai",
@@ -174,7 +179,8 @@
   --shadow-soft: 4px 5px 13px rgba(139, 106, 128, 0.15),
                  -3px -4px 10px rgba(255, 255, 255, 0.8);
 
-  --focus: 0 0 0 3px color-mix(in srgb, var(--cyan) 22%, transparent);
+  /* โครงเดียวกับธีม hud (P3-16) — คำนวณจริงบนพื้น #f3ebe6 ได้ 4.88:1 */
+  --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--cyan);
   --mark-glow: inset 2px 2px 5px rgba(255, 255, 255, 0.95),
                inset -2px -2px 6px rgba(139, 106, 128, 0.2);
   --orb-bg: radial-gradient(circle at 50% 30%, #ffffff, #f1e6e8 72%);
@@ -432,6 +438,48 @@ body {
   padding: 18px 18px 8px;
   scrollbar-width: thin;
   scrollbar-color: var(--thumb) transparent;
+  overflow-anchor: none;      /* เราคุมการเลื่อนเองใน scrollStream() */
+}
+
+/* ปุ่มลอย "↓ ล่าสุด" — โผล่เฉพาะตอนผู้ใช้เลื่อนขึ้นไปอ่านย้อนแล้วมีข้อความใหม่ */
+.jump {
+  position: absolute;
+  inset-inline-end: 18px;
+  bottom: 14px;
+  z-index: 3;
+  min-height: 44px;           /* เป้าแตะขั้นต่ำบนมือถือ */
+  padding: 10px 16px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 45%, transparent);
+  border-radius: 999px;
+  background: var(--panel-solid);
+  box-shadow: var(--shadow-panel);
+  color: var(--cyan);
+  font-family: var(--thai);
+  font-size: 14.5px;
+  cursor: pointer;
+}
+
+.jump[hidden] { display: none; }
+.jump:hover { border-color: var(--cyan); }
+
+/* คั่นเมื่อ session ใหม่ถูกสร้าง — บอกชัดว่า AI ไม่จำข้อความด้านบนแล้ว */
+.reset-mark {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 6px;
+  color: var(--amber);
+  font-family: var(--thai);
+  font-size: 13px;
+  text-align: center;
+}
+
+.reset-mark::before,
+.reset-mark::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: color-mix(in srgb, var(--amber) 35%, transparent);
 }
 
 .stream::-webkit-scrollbar { width: 9px; }
@@ -694,6 +742,47 @@ body {
   flex-wrap: wrap;
 }
 
+/* แถบแจ้งเตือนในตัว dock — ต้องเห็นได้ทุกความกว้างจอ ไม่ผูกกับแผงข้าง (P2-8) */
+.dock-alert {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 0 100%;
+  order: 9;                    /* ไปอยู่ท้าย dock เสมอ ไม่แทรกกลางปุ่ม */
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--red) 55%, transparent);
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  color: var(--text);
+  font-family: var(--thai);
+  font-size: 14.5px;
+  line-height: 1.5;
+}
+
+.dock-alert[hidden] { display: none; }
+
+.dock-alert .ico {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--red);
+  color: var(--bg);
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.dock-alert .msg { flex: 1; min-width: 0; }
+
+.dock-alert .btn {
+  flex: none;
+  min-height: 44px;
+  min-width: 44px;
+  justify-content: center;
+}
+
 /* วงกลมไมค์ + วงแหวนระดับเสียง */
 .orb {
   position: relative;
@@ -728,8 +817,41 @@ body {
 .orb[data-state="speaking"] { color: var(--magenta); border-color: color-mix(in srgb, var(--magenta) 50%, transparent); }
 .orb[data-state="speaking"] .ring .val { stroke: var(--magenta); }
 .orb[data-state="thinking"] { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 45%, transparent); }
+.orb[data-state="thinking"] .ring .val { stroke: var(--amber); }
 .orb[data-state="listening"] { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
 .orb[data-state="listening"] .ring .val { stroke: var(--green); }
+
+/* กำลังค้นเน็ต — ใช้สีม่วงที่ประกาศไว้ในชุดสีแต่เดิมไม่เคยได้ใช้ */
+.orb[data-state="searching"] { color: var(--violet); border-color: color-mix(in srgb, var(--violet) 50%, transparent); }
+.orb[data-state="searching"] .ring .val { stroke: var(--violet); }
+
+/* มีปัญหา — ต้องแยกจาก idle ได้ทั้งด้วยสีและด้วยข้อความข้าง ๆ */
+.orb[data-state="error"] { color: var(--red); border-color: color-mix(in srgb, var(--red) 60%, transparent); }
+.orb[data-state="error"] .ring .val { stroke: var(--red); stroke-dashoffset: 0; }
+
+/* ระหว่างคิด/ค้นเน็ตไม่มีระดับเสียงมาขับวงแหวน จึงหมุนส่วนโค้งให้เห็นว่ายังทำงานอยู่
+   (2-8 วินาทีที่เคยดูเหมือนหน้าค้าง) */
+@keyframes orb-sweep {
+  from { transform: rotate(-90deg); }
+  to   { transform: rotate(270deg); }
+}
+
+.orb[data-state="thinking"] svg.ring,
+.orb[data-state="searching"] svg.ring {
+  animation: orb-sweep 1.5s linear infinite;
+}
+
+.orb[data-state="thinking"] .ring .val,
+.orb[data-state="searching"] .ring .val {
+  stroke-dashoffset: 158;         /* โค้งราว 30% ของวง */
+  transition: none;
+}
+
+/* ปิด motion ตามความต้องการของผู้ใช้ — สถานะยังอ่านได้จากสีและข้อความ */
+@media (prefers-reduced-motion: reduce) {
+  .orb svg.ring { animation: none !important; }
+  .orb .ring .val { transition: none !important; }
+}
 
 .status-text {
   min-width: 210px;
@@ -808,6 +930,38 @@ body {
 
 .btn.ghost { border-color: transparent; background: transparent; }
 
+/* ---------- โฟกัสคีย์บอร์ด (P3-16) ----------
+   ทุกชิ้นที่กดได้ต้องเห็นวงโฟกัสตอนไล่ Tab ทั้งสองธีม ใช้ :focus-visible เพื่อไม่ให้
+   วงโฟกัสโผล่ตอนคลิกเมาส์ และประกาศแยกจาก :hover เพราะสองอย่างนี้คนละความหมาย */
+.btn:focus-visible,
+.jump:focus-visible,
+.compose input:focus-visible,
+[tabindex]:not([tabindex="-1"]):focus-visible {
+  outline: 2px solid transparent;   /* ให้โหมด forced-colors ยังเห็นวง */
+  outline-offset: 2px;
+  box-shadow: var(--focus);
+  border-color: var(--line-hot);
+}
+
+.btn.primary:focus-visible { box-shadow: var(--focus); }
+
+/* เบราว์เซอร์ที่รู้จัก :focus-visible ไม่ต้องวาดวงซ้ำตอนคลิกเมาส์ */
+.btn:focus:not(:focus-visible),
+.jump:focus:not(:focus-visible) { outline: none; }
+
+/* ข้อความที่มีไว้ให้ screen reader อ่านอย่างเดียว (ดู #sr-live) */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 .controls { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* ช่องพิมพ์ */
@@ -838,19 +992,32 @@ body {
 
 .compose input::placeholder { color: var(--faint); }
 
-/* ---------- Onboarding ---------- */
+/* ---------- Onboarding ----------
+   เป็น <dialog> จริง (P3-16) จึงได้ focus trap, ปิดด้วย Esc, background เป็น inert
+   และการคืนโฟกัสให้ปุ่มที่เปิดโมดัล มาจากตัวเบราว์เซอร์เอง ไม่ต้องเขียนเลียนแบบ */
 .overlay {
   position: fixed;
   inset: 0;
   z-index: 50;
   display: grid;
   place-items: center;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  margin: 0;
   padding: 22px;
+  border: 0;
   background: var(--overlay-bg);
+  color: inherit;
   backdrop-filter: blur(10px);
 }
 
 .overlay[hidden] { display: none; }
+/* UA ตั้ง `dialog:not([open]) { display: none }` ไว้ แต่ `display: grid` ข้างบน
+   มี specificity สูงกว่า ต้องประกาศเองไม่งั้นโมดัลค้างเต็มจอตลอดเวลา */
+.overlay:not([open]) { display: none; }
+.overlay::backdrop { background: transparent; }
 
 .tour {
   position: relative;

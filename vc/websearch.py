@@ -9,10 +9,12 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
+import time
 from html.parser import HTMLParser
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import httpx
 
@@ -23,6 +25,14 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 SKIP_TAGS = {"script", "style", "noscript", "svg", "head", "nav", "footer", "form"}
 _WS = re.compile(r"[ \t\xa0]+")
 _NL = re.compile(r"\n{3,}")
+
+# ───────────────────────────────────── ข้อจำกัดของการเปิดหน้าเว็บ (P1-3: SSRF)
+MAX_HOPS = 3                       # จำนวน redirect สูงสุดที่ยอมตาม
+ALLOWED_PORTS = {80, 443}          # พอร์ตอื่นคือการสแกนพอร์ตภายในโดยปริยาย
+ALLOWED_SCHEMES = ("http", "https")
+DEFAULT_MAX_BYTES = 512_000        # เพดานไบต์ที่ยอมอ่านเข้ามาต่อหนึ่งหน้า
+ALLOWED_CONTENT_TYPES = ("text/", "application/xhtml+xml", "application/json")
+CONNECT_TIMEOUT = 5.0
 
 
 class SearchError(RuntimeError):
@@ -147,19 +157,84 @@ def html_to_text(html: str) -> tuple[str, str]:
 
 # ──────────────────────────────────────────────────────────────── กันยิงเข้าเครือข่ายใน
 def _is_public(host: str) -> bool:
+    """ที่อยู่นี้ชี้ออกอินเทอร์เน็ตจริงไหม — ตรวจ **ทุก** IP ที่ DNS ตอบกลับมา
+
+    known limitation: DNS rebinding TOCTOU — เราตรวจตอน resolve แล้วปล่อยให้
+    httpx resolve เองอีกครั้งตอนต่อจริง ผู้โจมตีที่คุมโดเมนและตั้ง TTL สั้นมาก
+    ยังสลับคำตอบระหว่างสองจังหวะได้ การอุดต้องต่อไปที่ IP ที่ตรวจแล้วโดยตรง
+    พร้อมตั้ง Host header/SNI เอง ซึ่งกระทบการตรวจใบรับรอง TLS — เก็บไว้เป็น
+    งานแยก (ดู PR ของ P1-3)
+    """
+    if not host:
+        return False
+    bare = host.strip("[]")
+    try:                       # เป็น IP ตรง ๆ ไม่ต้องถาม DNS
+        ip = ipaddress.ip_address(bare)
+    except ValueError:
+        pass
+    else:
+        return _public_ip(ip)
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = socket.getaddrinfo(bare, None)
     except OSError:
+        return False
+    if not infos:
         return False
     for info in infos:
         try:
             ip = ipaddress.ip_address(info[4][0])
         except ValueError:
             return False
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast):
+        if not _public_ip(ip):
             return False
     return True
+
+
+def _public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        return False
+    if ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)     # ::ffff:127.0.0.1
+    if mapped is not None:
+        return _public_ip(mapped)
+    return True
+
+
+def assert_fetchable(url: str) -> str:
+    """ตรวจว่า URL นี้ยอมให้เปิดได้ไหม — คืน URL เดิมถ้าผ่าน ไม่ผ่านโยน SearchError
+
+    ใช้ร่วมกันทั้งตอนเปิดหน้าเว็บและตอนตรวจ URL ที่โมเดลขอเปิด (P1-4)
+    กติกา: http/https เท่านั้น · พอร์ต 80/443 เท่านั้น · โฮสต์ต้องชี้ IP สาธารณะ
+    """
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme not in ALLOWED_SCHEMES or not parsed.netloc:
+        raise SearchError("เปิดได้เฉพาะลิงก์ http/https")
+    if parsed.username or parsed.password:
+        raise SearchError("ไม่อนุญาตลิงก์ที่ฝังชื่อผู้ใช้/รหัสผ่าน")
+    try:
+        port = parsed.port
+    except ValueError:
+        raise SearchError("หมายเลขพอร์ตในลิงก์ไม่ถูกต้อง") from None
+    # ตรวจโฮสต์ก่อนพอร์ต เพื่อให้ข้อความบอกสาเหตุที่สำคัญกว่า (ยิงเข้าวงใน)
+    if not _is_public(parsed.hostname or ""):
+        raise SearchError("ไม่อนุญาตให้เปิดที่อยู่ในเครือข่ายภายใน")
+    port = port or (443 if parsed.scheme == "https" else 80)
+    if port not in ALLOWED_PORTS:
+        raise SearchError(f"ไม่อนุญาตพอร์ต {port} (เปิดได้เฉพาะ 80 และ 443)")
+    return url
+
+
+def _content_type_ok(value: str) -> bool:
+    kind = (value or "").split(";", 1)[0].strip().lower()
+    return any(kind.startswith(ok) for ok in ALLOWED_CONTENT_TYPES)
+
+
+def _max_bytes() -> int:
+    try:
+        return max(1024, int(os.environ.get("FETCH_MAX_BYTES") or DEFAULT_MAX_BYTES))
+    except ValueError:
+        return DEFAULT_MAX_BYTES
 
 
 # ───────────────────────────────────────────────────────────────────────── API หลัก
@@ -170,7 +245,8 @@ def search(query: str, limit: int = 5, timeout: float = 12.0) -> list[dict]:
     try:
         r = httpx.post(ENDPOINT, data={"q": query, "kl": "th-th"},
                        headers={"User-Agent": UA, "Accept-Language": "th,en;q=0.8"},
-                       timeout=timeout, follow_redirects=True)
+                       timeout=httpx.Timeout(timeout, connect=CONNECT_TIMEOUT),
+                       follow_redirects=True)
     except httpx.HTTPError as exc:
         raise SearchError(f"ต่ออินเทอร์เน็ตไม่ได้: {exc}") from exc
     if r.status_code >= 400:
@@ -191,26 +267,96 @@ def search(query: str, limit: int = 5, timeout: float = 12.0) -> list[dict]:
     return out
 
 
-def fetch_page(url: str, max_chars: int = 3000, timeout: float = 12.0) -> str:
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise SearchError("เปิดได้เฉพาะลิงก์ http/https")
-    if not _is_public(parsed.hostname or ""):
-        raise SearchError("ไม่อนุญาตให้เปิดที่อยู่ในเครือข่ายภายใน")
-    try:
-        r = httpx.get(url, headers={"User-Agent": UA}, timeout=timeout,
-                      follow_redirects=True)
-    except httpx.HTTPError as exc:
-        raise SearchError(f"เปิดหน้าเว็บไม่ได้: {exc}") from exc
-    if r.status_code >= 400:
-        raise SearchError(f"หน้าเว็บตอบ {r.status_code}")
-    if "html" not in r.headers.get("content-type", "").lower():
-        raise SearchError("ลิงก์นี้ไม่ใช่หน้าเว็บที่อ่านเป็นข้อความได้")
+def fetch_page(url: str, max_chars: int = 3000, timeout: float = 12.0,
+               max_bytes: int | None = None,
+               transport: httpx.BaseTransport | None = None) -> str:
+    """เปิดอ่านหน้าเว็บแบบมีขอบเขต
 
-    title, text = html_to_text(r.text)
+    เดิมเช็คแค่ URL แรกแล้วสั่ง `follow_redirects=True` ผู้โจมตีจึงพา redirect
+    เข้าเครือข่ายภายในได้ (PoC สำเร็จจริง) ตอนนี้จึงตาม redirect เอง แล้วตรวจ
+    ทุก hop ด้วย `assert_fetchable()` พร้อมเพดานอีกสามชั้น:
+      · จำนวน hop  · ขนาดไบต์ที่อ่าน (FETCH_MAX_BYTES)  · เวลารวมทั้งคำขอ
+    """
+    cap = max_bytes if max_bytes is not None else _max_bytes()
+    deadline = time.monotonic() + max(1.0, timeout)
+    target = assert_fetchable(url)
+
+    def left() -> float:
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            raise SearchError(f"เปิดหน้าเว็บไม่ทันใน {timeout:.0f} วินาที")
+        return remain
+
+    limits = httpx.Timeout(connect=min(CONNECT_TIMEOUT, max(1.0, timeout)),
+                           read=timeout, write=timeout, pool=timeout)
+    client = httpx.Client(
+        timeout=limits,
+        follow_redirects=False,
+        transport=transport,
+        # ขอเนื้อหาดิบเท่านั้น เพื่อให้ FETCH_MAX_BYTES เป็นเพดานหน่วยความจำจริง
+        # `iter_bytes()` ของ httpx จะคลาย gzip ก่อนคืน chunk ซึ่งเปิดทางให้ zip bomb
+        headers={"User-Agent": UA, "Accept-Encoding": "identity"},
+    )
+    try:
+        for hop in range(MAX_HOPS + 1):
+            remain = left()
+            # timeout ต้องหดตามงบรวมที่เหลือ ไม่ใช่เริ่มนับ `timeout` ใหม่ทุก redirect
+            request_timeout = httpx.Timeout(
+                remain, connect=min(CONNECT_TIMEOUT, remain))
+            try:
+                with client.stream("GET", target, timeout=request_timeout) as r:
+                    if r.is_redirect:
+                        location = r.headers.get("location", "")
+                        if hop >= MAX_HOPS:
+                            raise SearchError(
+                                f"too many redirects (เกิน {MAX_HOPS} ครั้ง)")
+                        if not location:
+                            raise SearchError("หน้าเว็บสั่งเปลี่ยนทางแต่ไม่บอกปลายทาง")
+                        # ตรวจ "ทุก hop" — จุดที่บั๊กเดิมข้ามไป
+                        target = assert_fetchable(urljoin(str(r.url), location))
+                        continue
+                    if r.status_code >= 400:
+                        raise SearchError(f"หน้าเว็บตอบ {r.status_code}")
+                    # ตรวจชนิดเนื้อหาจาก header ก่อนอ่าน body แม้แต่ไบต์เดียว
+                    ctype = r.headers.get("content-type", "")
+                    if not _content_type_ok(ctype):
+                        raise SearchError(
+                            "ลิงก์นี้ไม่ใช่หน้าเว็บที่อ่านเป็นข้อความได้"
+                            + (f" ({ctype.split(';')[0]})" if ctype else ""))
+                    content_encoding = (
+                        r.headers.get("content-encoding", "").strip().lower())
+                    if content_encoding not in ("", "identity"):
+                        # ตรวจ header ก่อนอ่าน body แม้แต่ไบต์เดียว: เซิร์ฟเวอร์ที่ไม่ทำตาม
+                        # Accept-Encoding: identity อาจส่ง gzip bomb ที่ขยายใหญ่กว่า cap มาก
+                        raise SearchError(
+                            "หน้าเว็บส่งเนื้อหาแบบบีบอัดแม้ขอ identity "
+                            f"({content_encoding}) จึงไม่อ่านเพื่อความปลอดภัย")
+                    body = bytearray()
+                    # ไม่ระบุ chunk_size: ถ้าบังคับให้สะสมก้อนใหญ่ slow-drip จะค้าง
+                    # อยู่ใน iterator จน deadline ไม่มีโอกาสถูกตรวจ
+                    # หลังปฏิเสธ Content-Encoding แล้ว iter_bytes() จะไม่คลายข้อมูล
+                    # เพิ่ม และยังรองรับ MockTransport/response ที่ buffer มาแล้ว
+                    for chunk in r.iter_bytes():
+                        left()
+                        room = cap - len(body)
+                        if room <= 0:
+                            break
+                        body.extend(chunk[:room])
+                        if len(chunk) >= room:
+                            break           # ออกจาก with = ปิดคอนเนกชันทันที
+                    html = bytes(body).decode(r.encoding or "utf-8", errors="replace")
+                    break
+            except httpx.HTTPError as exc:
+                raise SearchError(f"เปิดหน้าเว็บไม่ได้: {exc}") from exc
+        else:
+            raise SearchError(f"too many redirects (เกิน {MAX_HOPS} ครั้ง)")
+    finally:
+        client.close()
+
+    title, text = html_to_text(html)
     if len(text) > max_chars:
         text = text[:max_chars].rsplit("\n", 1)[0] + "\n…(ตัดเนื้อหาส่วนที่เหลือออก)"
-    return f"{title}\n{url}\n\n{text}" if title else f"{url}\n\n{text}"
+    return f"{title}\n{target}\n\n{text}" if title else f"{target}\n\n{text}"
 
 
 def format_results(results: list[dict]) -> str:
@@ -235,6 +381,7 @@ def host_of(url: str) -> str:
 
 
 def sources(results: list[dict], limit: int = 3) -> str:
+    """สรุปชื่อโดเมนของผลค้นหา ใช้โชว์แหล่งที่มาแบบย่อ"""
     hosts: list[str] = []
     for r in results:
         host = r.get("host") or host_of(r["url"])
