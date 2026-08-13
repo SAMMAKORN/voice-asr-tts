@@ -14,7 +14,7 @@ import numpy as np
 from vc.api import ApiClient, ApiError
 from vc.config import Config
 from vc.vad import VoiceGate
-from voice_chat import GREETING, VoiceChat
+from voice_chat import VoiceChat, greeting_text
 
 from .bridge import Outbox, WebConsole, WebMic, WebSpeaker
 
@@ -121,6 +121,14 @@ class WebSession(VoiceChat):
             if not self.cfg.tts_enabled:
                 self.interrupt("ปิดเสียง", log_event=False)
             self.out.json("setting", key="mute", on=not self.cfg.tts_enabled)
+        elif kind == "tts_voice":
+            # เปลี่ยนกลางประโยคแล้วจะได้ยินเสียงสองคนในคำตอบเดียว — ตัดของเดิมทิ้งก่อน
+            if self.cfg.set_tts_voice(str(msg.get("value", ""))):
+                if self.busy:
+                    self.interrupt("เปลี่ยนเสียงพูด", log_event=False)
+                self.log.event("tts_voice", value=self.cfg.tts_voice_value)
+            self.out.json("setting", key="tts_voice",
+                          value=self.cfg.tts_voice_value, label=self.cfg.tts_label)
         elif kind == "echo_guard":
             self.cfg.echo_guard = bool(msg.get("on"))
             self.out.json("setting", key="echo_guard", on=self.cfg.echo_guard)
@@ -146,6 +154,8 @@ class WebSession(VoiceChat):
             chat_model=self.cfg.chat_model,
             asr_model=self.cfg.asr_model,
             tts_model=self.cfg.tts_model,
+            tts_label=self.cfg.tts_label,
+            tts_voice=self.cfg.tts_voice_value,
             base_url=self.cfg.base_url,
             mic_sr=self.cfg.mic_sr,
             speaker_sr=self.cfg.speaker_sr,
@@ -197,7 +207,7 @@ def run_selftest(cfg: Config) -> dict:
     try:
         t0 = time.perf_counter()
         pcm = api.synthesize(sample, cfg.mic_sr)
-        add("TTS", cfg.tts_model, True,
+        add("TTS", cfg.tts_label, True,
             f"สังเคราะห์เสียงได้ {pcm.size / cfg.mic_sr:.2f} วินาที",
             int((time.perf_counter() - t0) * 1000))
 
@@ -230,4 +240,4 @@ def run_selftest(cfg: Config) -> dict:
         api.close()
 
     return {"ok": bool(steps) and all(s["ok"] for s in steps), "steps": steps,
-            "greeting": GREETING}
+            "greeting": greeting_text(cfg.voice_gender)}

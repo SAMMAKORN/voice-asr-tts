@@ -226,7 +226,22 @@ class ApiClient:
 
     # ------------------------------------------------------------------- tts
     def synthesize(self, text: str, dst_sr: int) -> np.ndarray:
-        """OmniVoice ผ่าน LiteLLM รับได้แค่ {model, input} — ใส่ voice/format แล้ว 500"""
+        """OmniVoice ผ่าน LiteLLM รับได้แค่ {model, input} — ใส่ voice/format แล้ว 500
+
+        ถ้าตั้ง TTS_BACKEND=edge จะไปเรียก Microsoft Edge แทน (เลือกเสียงได้
+        และเสียงคงที่ทุกก้อน) — import ตรงนี้เพื่อไม่ให้ import วนกันกับ tts_edge
+        """
+        if self.cfg.use_edge_tts:
+            from .tts_edge import synthesize as edge_synthesize
+
+            return edge_synthesize(
+                text, dst_sr,
+                voice=self.cfg.edge_voice,
+                rate=self.cfg.edge_rate,
+                volume=self.cfg.edge_volume,
+                pitch=self.cfg.edge_pitch,
+            )
+
         payload = {"model": self.cfg.tts_model, "input": text}
         r = self._audio.post("/v1/audio/speech", json=payload)
         if r.status_code >= 400:

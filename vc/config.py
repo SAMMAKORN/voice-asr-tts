@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# รูปแบบชื่อเสียงของ Microsoft เช่น th-TH-PremwadeeNeural
+VOICE_NAME = re.compile(r"^[A-Za-z]{2,3}-[A-Za-z0-9]{2,8}-[A-Za-z0-9]{2,40}$")
 
 THAI_DAYS = ("วันจันทร์", "วันอังคาร", "วันพุธ", "วันพฤหัสบดี",
              "วันศุกร์", "วันเสาร์", "วันอาทิตย์")
@@ -57,9 +61,21 @@ TOOL_INSTRUCTION = (
     "ความรู้ในตัวคุณเก่าแล้ว การเดาตัวเลขเองถือว่าผิดร้ายแรง "
     "ส่วนคำถามความรู้ทั่วไปที่ไม่เปลี่ยนตามเวลา ตอบเองได้เลยไม่ต้องค้น\n"
     "เมื่อตอบจากผลค้นหา ให้บอกแหล่งที่มาสั้น ๆ แบบภาษาพูด "
-    "เช่น 'อ้างอิงจากสมาคมค้าทองคำนะครับ' พร้อมบอกวันที่ของข้อมูลถ้ามี "
+    "เช่น 'อ้างอิงจากสมาคมค้าทองคำนะ' พร้อมบอกวันที่ของข้อมูลถ้ามี "
     "ห้ามอ่าน URL ออกเสียง"
 )
+
+
+def _persona_instruction(gender: str) -> str:
+    """บอกโมเดลให้แทนตัวเอง/ลงท้ายประโยคให้ตรงเพศของเสียงพูดที่เลือกไว้
+
+    ไม่งั้นโมเดลชอบเดาเป็น 'ผม...ครับ' โดยอัตโนมัติ ทำให้เสียงผู้หญิงพูดคำลงท้ายผิดเพศ
+    """
+    if gender == "female":
+        return ("คุณแทนตัวเองว่า 'ดิฉัน' และลงท้ายประโยคด้วย 'ค่ะ' "
+                "(หรือ 'คะ' เมื่อประโยคเป็นคำถามหรือคำขอ) ให้ตรงกับเสียงพูดที่เลือกไว้เสมอ")
+    return ("คุณแทนตัวเองว่า 'ผม' และลงท้ายประโยคด้วย 'ครับ' "
+            "ให้ตรงกับเสียงพูดที่เลือกไว้เสมอ")
 
 
 @dataclass
@@ -104,6 +120,14 @@ class Config:
     tts_chunk_chars: int = 60         # ขนาดก้อนที่สอง (ต้องสังเคราะห์ทันก่อนก้อนแรกเล่นจบ)
     tts_chunk_growth: float = 1.8     # ก้อนถัด ๆ ไปโตขึ้นเท่านี้ (ลดจำนวนครั้งที่เสียงเปลี่ยน)
     tts_search_filler: bool = True    # พูด "ขอค้นข้อมูลสักครู่" ระหว่างค้นเน็ตไหม
+
+    # --- แบ็กเอนด์เสียงพูด: "api" = TTS_MODEL บนเซิร์ฟเวอร์ · "edge" = Microsoft Edge ---
+    tts_backend: str = "api"
+    edge_voice: str = "th-TH-PremwadeeNeural"
+    edge_rate: str = "+0%"            # ความเร็ว เช่น +15% เร็วขึ้น, -10% ช้าลง
+    edge_volume: str = "+0%"
+    edge_pitch: str = "+0Hz"          # ระดับเสียงสูงต่ำ เช่น +20Hz
+
     save_audio: bool = False
     history_turns: int = 20      # จำนวนข้อความย้อนหลังที่ส่งให้โมเดล
     keep_findings: int = 4       # จำนวนผลค้นเว็บย้อนหลังที่คงไว้ในความจำ
@@ -120,6 +144,59 @@ class Config:
     def frame_samples(self) -> int:
         return int(self.mic_sr * self.frame_ms / 1000)
 
+    @property
+    def use_edge_tts(self) -> bool:
+        return self.tts_backend == "edge"
+
+    @property
+    def tts_label(self) -> str:
+        """ชื่อเสียงพูดที่กำลังใช้ สำหรับโชว์บนหัวเทอร์มินัลและ chip บนหน้าเว็บ"""
+        if self.use_edge_tts:
+            from .tts_edge import voice_label   # import ตรงนี้กัน import วนกลับมาที่ config
+
+            return f"Edge · {voice_label(self.edge_voice)}"
+        return self.tts_model
+
+    @property
+    def voice_gender(self) -> str:
+        """เพศของเสียงที่กำลังใช้พูด — ตัดสินคำลงท้าย (ครับ/ค่ะ) ในคำตอบของโมเดล
+
+        แบ็กเอนด์ api มีเสียงเดียวตายตัว (TTS_MODEL) ไม่มีตัวเลือกเพศจึงถือเป็นชายเสมอ
+        """
+        if self.use_edge_tts:
+            from .tts_edge import voice_gender as _voice_gender
+
+            return _voice_gender(self.edge_voice)
+        return "male"
+
+    @property
+    def tts_voice_value(self) -> str:
+        """ค่าเดียวที่บอกทั้งแบ็กเอนด์และเสียง — ใช้คุยกับหน้าเว็บ"""
+        return f"edge:{self.edge_voice}" if self.use_edge_tts else "api"
+
+    def set_tts_voice(self, value: str) -> bool:
+        """รับค่าจากหน้าเว็บ ("api" / "edge:<voice>") คืน True เมื่อเปลี่ยนจริง
+
+        ค่ามาจากเบราว์เซอร์จึงตรวจรูปแบบก่อน — ชื่อเสียงถูกส่งต่อเข้า SSML
+        ของ edge-tts ปล่อยข้อความอิสระผ่านไปไม่ได้
+        """
+        value = (value or "").strip()
+        if value == "api":
+            if not self.tts_model:
+                return False
+            changed = self.use_edge_tts
+            self.tts_backend = "api"
+            return changed
+        if value.startswith("edge:"):
+            voice = value[5:].strip()
+            if not VOICE_NAME.match(voice):
+                return False
+            changed = not self.use_edge_tts or voice != self.edge_voice
+            self.tts_backend = "edge"
+            self.edge_voice = voice
+            return changed
+        return False
+
     def system_message(self) -> dict:
         """ประกอบ system prompt: กติกาเครื่องมือ → วันเวลาปัจจุบัน → บุคลิกที่ผู้ใช้ตั้ง
 
@@ -133,6 +210,7 @@ class Config:
         parts = []
         if self.web_search:
             parts.append(TOOL_INSTRUCTION)
+        parts.append(_persona_instruction(self.voice_gender))
         parts.append(stamp)
         parts.append(self.system_prompt)
         return {"role": "system", "content": "\n\n".join(parts)}
@@ -146,6 +224,10 @@ def load_config() -> Config:
     missing = [k for k, v in (("API_BASE_URL", base), ("API_KEY", key)) if not v]
     if missing:
         raise SystemExit(f"ไม่พบค่าใน .env: {', '.join(missing)}")
+
+    backend = (os.environ.get("TTS_BACKEND") or "api").strip().lower()
+    if backend not in ("api", "edge"):
+        raise SystemExit(f"TTS_BACKEND ต้องเป็น api หรือ edge เท่านั้น (ได้ '{backend}')")
 
     return Config(
         base_url=base,
@@ -175,6 +257,11 @@ def load_config() -> Config:
         tts_chunk_chars=_i("TTS_CHUNK_CHARS", 60),
         tts_chunk_growth=_f("TTS_CHUNK_GROWTH", 1.8),
         tts_search_filler=_b("TTS_SEARCH_FILLER", True),
+        tts_backend=backend,
+        edge_voice=os.environ.get("EDGE_TTS_VOICE") or "th-TH-PremwadeeNeural",
+        edge_rate=os.environ.get("EDGE_TTS_RATE") or "+0%",
+        edge_volume=os.environ.get("EDGE_TTS_VOLUME") or "+0%",
+        edge_pitch=os.environ.get("EDGE_TTS_PITCH") or "+0Hz",
         keep_findings=_i("KEEP_FINDINGS", 4),
         web_search=_b("WEB_SEARCH", True),
         search_results=_i("SEARCH_RESULTS", 5),

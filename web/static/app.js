@@ -358,7 +358,10 @@ function stopPlayback() {
 // ───────────────────────────────────────────────────────── WebSocket
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  // ส่งเสียงที่เลือก/จำไว้ไปตั้งแต่ตอนต่อ WebSocket กัน session ทักทายด้วยเสียง
+  // ของ .env ไปก่อนแล้วค่อยสลับทีหลัง (พูดผิดเพศไปแล้วประโยคแรก)
+  const voice = encodeURIComponent($('sel-voice').value || '');
+  ws = new WebSocket(`${proto}://${location.host}/ws?voice=${voice}`);
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
@@ -400,9 +403,17 @@ function handleJson(m) {
       CFG.speaker_sr = m.speaker_sr || CFG.speaker_sr;
       $('chip-llm').textContent = m.chat_model;
       $('chip-asr').textContent = m.asr_model;
-      $('chip-tts').textContent = m.tts_model;
       $('btn-mute').dataset.on = m.tts_enabled ? '0' : '1';
       $('btn-echo').dataset.on = m.echo_guard ? '1' : '0';
+      if (!voiceFilled) {
+        fillVoices(null, m.tts_voice, m.tts_label);
+      } else if ($('sel-voice').value && $('sel-voice').value !== m.tts_voice) {
+        // เคยเลือกเสียงไว้แล้วแต่เซิร์ฟเวอร์เริ่มมาด้วยค่าจาก .env — สลับให้ตรงกัน
+        // (รอ 'setting' ตอบกลับค่อยอัปเดตชิป กันโชว์ค่าที่กำลังจะถูกแทนที่วูบเดียว)
+        send({ type: 'tts_voice', value: $('sel-voice').value });
+      } else {
+        $('chip-tts').textContent = m.tts_label || m.tts_model;
+      }
       controls(true);
       $('btn-start').textContent = '● ทำงานอยู่';
       $('btn-start').disabled = true;
@@ -460,6 +471,11 @@ function handleJson(m) {
     case 'setting':
       if (m.key === 'mute') $('btn-mute').dataset.on = m.on ? '1' : '0';
       if (m.key === 'echo_guard') $('btn-echo').dataset.on = m.on ? '1' : '0';
+      if (m.key === 'tts_voice') {
+        $('sel-voice').value = m.value;
+        $('chip-tts').textContent = m.label;
+        addLog(`ใช้เสียงพูด: ${m.label}`);
+      }
       break;
 
     case 'cleared':
@@ -534,6 +550,46 @@ $('btn-echo').addEventListener('click', (e) => {
   send({ type: 'echo_guard', on });
   addLog(on ? 'เปิดระบบกันเสียงลำโพงย้อนเข้าไมค์ (โหมดลำโพง)'
             : 'ปิดระบบกันเสียงลำโพง — พูดแทรกไวสุด (โหมดหูฟัง)');
+});
+
+// ───────────────────────────────────────────────────────── เสียงพูดของ AI
+/* ค่า value เป็น "api" หรือ "edge:<ชื่อเสียง>" ตามที่ /api/config ส่งมา
+   จำที่เลือกไว้ในเครื่อง เพราะเสียงเป็นเรื่องรสนิยม ไม่ควรต้องเลือกใหม่ทุกครั้ง */
+const VOICE_KEY = 'voicelink.voice.v1';
+let voiceFilled = false;
+
+function savedVoice() {
+  try { return localStorage.getItem(VOICE_KEY); } catch (_) { return null; }
+}
+
+function fillVoices(items, current, currentLabel) {
+  const sel = $('sel-voice');
+  const list = (items && items.length)
+    ? items
+    : [{ value: current || 'api', label: currentLabel || current || 'เสียงตั้งต้น' }];
+  sel.innerHTML = '';
+  for (const it of list) {
+    const o = document.createElement('option');
+    o.value = it.value;
+    o.textContent = it.label;
+    sel.appendChild(o);
+  }
+  const want = savedVoice();
+  const chosen = list.some((i) => i.value === want) ? want : (current || list[0].value);
+  sel.value = chosen;
+  // ชิปด้านบนต้องโชว์ตรงกับตัวที่ dropdown เลือกจริง ไม่ใช่ค่าดิบจาก .env เสมอไป
+  // (ถ้าเคยเลือกเสียงอื่นจำไว้ใน localStorage ก็ต้องโชว์เสียงนั้น ไม่ใช่ค่าตั้งต้น)
+  const match = list.find((i) => i.value === chosen);
+  $('chip-tts').textContent = (match && match.label) || currentLabel || chosen;
+  voiceFilled = true;
+}
+
+$('sel-voice').addEventListener('change', (e) => {
+  const value = e.currentTarget.value;
+  try { localStorage.setItem(VOICE_KEY, value); } catch (_) { /* ปิด localStorage ไว้ */ }
+  stopPlayback();
+  if (live) send({ type: 'tts_voice', value });
+  else addLog('จำเสียงที่เลือกไว้แล้ว จะใช้ตอนเริ่มระบบ');
 });
 
 $('btn-clear').addEventListener('click', () => send({ type: 'clear' }));
@@ -633,7 +689,9 @@ $('btn-check').addEventListener('click', async (e) => {
   const wait = row('…', 'ระบบ', 'กำลังเรียก TTS → ASR → LLM ตามลำดับ', '');
   box.appendChild(wait);
   try {
-    const res = await fetch('/api/selftest', { method: 'POST' });
+    // ทดสอบด้วยเสียงที่ผู้ใช้เลือกไว้จริง ๆ ไม่ใช่ค่าตั้งต้นใน .env
+    const voice = encodeURIComponent($('sel-voice').value || '');
+    const res = await fetch('/api/selftest?voice=' + voice, { method: 'POST' });
     const data = await res.json();
     box.innerHTML = '';
     for (const s of data.steps) {
@@ -685,7 +743,7 @@ function row(icon, name, detail, ms, ok, model) {
     CFG = Object.assign(CFG, data);
     $('chip-llm').textContent = data.chat_model;
     $('chip-asr').textContent = data.asr_model;
-    $('chip-tts').textContent = data.tts_model;
+    fillVoices(data.tts_voices, data.tts_voice, data.tts_label);
   } catch (_) {
     addLog('อ่านค่าตั้งจากเซิร์ฟเวอร์ไม่ได้', 'warn');
   }

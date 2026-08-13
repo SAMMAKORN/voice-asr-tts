@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from vc.config import Config, load_config
+from vc.tts_edge import THAI_VOICES, voice_label
 
 from .bridge import Outbox
 from .session import WebSession, run_selftest
@@ -38,6 +39,23 @@ def session_config() -> Config:
     return load_config()
 
 
+def voice_options(cfg: Config) -> list[dict]:
+    """ตัวเลือกเสียงพูดสำหรับ dropdown บนหน้าเว็บ
+
+    ค่า value ใช้รูป "api" หรือ "edge:<ชื่อเสียง>" เพื่อส่งกลับมาทาง WebSocket
+    ได้ทั้งก้อนเดียว ไม่ต้องแยกเป็นสองฟิลด์
+    """
+    items: list[dict] = []
+    if cfg.tts_model:
+        items.append({"value": "api", "label": f"เซิร์ฟเวอร์ · {cfg.tts_model}"})
+    names = [name for name, _label, _gender in THAI_VOICES]
+    if cfg.edge_voice and cfg.edge_voice not in names:
+        names.append(cfg.edge_voice)     # เสียงที่ตั้งเองใน .env ต้องเลือกกลับมาได้
+    for name in names:
+        items.append({"value": f"edge:{name}", "label": f"Edge · {voice_label(name)}"})
+    return items
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(STATIC / "index.html")
@@ -50,6 +68,9 @@ async def api_config() -> JSONResponse:
         "chat_model": cfg.chat_model,
         "asr_model": cfg.asr_model,
         "tts_model": cfg.tts_model,
+        "tts_label": cfg.tts_label,
+        "tts_voice": cfg.tts_voice_value,
+        "tts_voices": voice_options(cfg),
         "base_url": cfg.base_url,
         "mic_sr": cfg.mic_sr,
         "speaker_sr": cfg.speaker_sr,
@@ -58,8 +79,11 @@ async def api_config() -> JSONResponse:
 
 
 @app.post("/api/selftest")
-async def api_selftest() -> JSONResponse:
-    result = await asyncio.to_thread(run_selftest, session_config())
+async def api_selftest(voice: str = "") -> JSONResponse:
+    cfg = session_config()
+    if voice:
+        cfg.set_tts_voice(voice)   # ค่าผิดรูปถูกเมิน แล้วตกกลับไปใช้ค่าใน .env
+    result = await asyncio.to_thread(run_selftest, cfg)
     return JSONResponse(result)
 
 
@@ -80,7 +104,7 @@ async def _pump(ws: WebSocket, out: Outbox) -> None:
 
 
 @app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket) -> None:
+async def ws_endpoint(ws: WebSocket, voice: str = "") -> None:
     await ws.accept()
     loop = asyncio.get_running_loop()
     out = Outbox(loop)
@@ -91,6 +115,12 @@ async def ws_endpoint(ws: WebSocket) -> None:
         await ws.send_json({"type": "log", "level": "error", "text": str(exc)})
         await ws.close()
         return
+
+    if voice:
+        # เบราว์เซอร์ส่งเสียงที่จำไว้มาตั้งแต่ตอนต่อ WebSocket — ต้องตั้งค่า cfg
+        # ให้เสร็จก่อน WebSession เริ่มทักทาย ไม่งั้นทักทายไปด้วยเสียง/เพศจาก .env
+        # ก่อนที่ฝั่งเว็บจะทันส่งคำสั่งสลับเสียงมาทีหลัง (แข่งกันตอนเริ่ม session)
+        cfg.set_tts_voice(voice)   # ค่าผิดรูปถูกเมิน แล้วตกกลับไปใช้ค่าใน .env
 
     session = WebSession(cfg, out)
     worker = threading.Thread(target=session.run, name="session", daemon=True)

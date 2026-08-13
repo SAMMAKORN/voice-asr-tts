@@ -123,6 +123,9 @@
       <button class="btn danger" id="btn-stop" disabled title="หยุด AI ที่กำลังพูด">■ หยุด</button>
       <button class="btn" id="btn-mute" data-on="0" disabled title="ปิด/เปิดเสียงพูดของ AI">🔊 เสียง</button>
       <button class="btn" id="btn-echo" data-on="0" disabled title="เปิดเมื่อใช้ลำโพงดังแล้วไมค์ได้ยินเสียง AI ตัวเอง">🎧 หูฟัง</button>
+      <label class="btn picker" title="เลือกเสียงพูดของ AI">🗣
+        <select id="sel-voice" aria-label="เสียงพูดของ AI"></select>
+      </label>
       <button class="btn" id="btn-clear" disabled title="ล้างประวัติการสนทนา">🧹 ล้าง</button>
       <button class="btn ghost" id="btn-help" title="เปิดคู่มือการใช้งาน">? วิธีใช้</button>
     </div>
@@ -223,6 +226,8 @@
           <li>AI จะจำว่า<b>พูดค้างไว้แค่ไหน</b> จึงไม่พูดซ้ำท่อนที่คุณยังไม่ได้ยิน</li>
           <li>ปุ่ม <b>■ หยุด</b> สั่งหยุดด้วยมือ · <b>🔊 เสียง</b> ปิดเสียงเหลือแต่ข้อความ</li>
           <li>ปุ่ม <b>🎧 หูฟัง</b> เปิดเมื่อใช้<b>ลำโพงดัง</b>แล้วไมค์เผลอได้ยินเสียง AI เอง</li>
+          <li>ช่อง <b>🗣 เสียงพูด</b> เลือกเสียงที่ AI ใช้พูด — เสียงของ <b>Microsoft Edge</b>
+              (เปรมวดี หญิง · นิวัฒน์ ชาย) จะเป็นคนเดียวกันตลอดทั้งคำตอบ ระบบจำที่เลือกไว้ให้</li>
           <li>ปุ่ม <b>🧹 ล้าง</b> ล้างความจำการสนทนา เริ่มเรื่องใหม่</li>
           <li>ปุ่มธีมมุมขวาบนสลับหน้าตาได้สองแบบ — <b>🛰️ HUD</b> โทนมืด กับ <b>🧸 ดินน้ำมัน</b> โทนสว่าง ระบบจำที่เลือกไว้ให้</li>
         </ul>

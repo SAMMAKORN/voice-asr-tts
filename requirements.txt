@@ -7,6 +7,12 @@ sounddevice>=0.4.6
 fastapi>=0.110
 uvicorn[standard]>=0.29
 
+# --- เฉพาะ TTS_BACKEND=edge (Microsoft Edge) ---
+# soundfile ใช้ถอดรหัส MP3 ที่ Edge ส่งกลับมา — libsndfile ที่มากับ wheel
+# อ่าน MP3 ได้ในตัว ไม่ต้องติดตั้ง ffmpeg แยก
+edge-tts>=7.0
+soundfile>=0.12
+
 # --- เฉพาะตอนทดสอบด้วยเบราว์เซอร์จริง (tests/test_browser.py) ---
 # ติดตั้งเพิ่มเองเมื่อต้องใช้:
 #   pip install playwright && python3 -m playwright install chromium

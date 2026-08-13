@@ -12,6 +12,7 @@ import argparse
 import collections
 import os
 import queue
+import random
 import re
 import sys
 import threading
@@ -28,8 +29,35 @@ from vc.tools import TOOLS, ToolRunner, describe
 from vc.ui import Console, CYAN, GREEN, GRAY, MAGENTA, YELLOW
 from vc.vad import VoiceGate
 
-GREETING = "สวัสดีครับ ผมพร้อมคุยแล้ว พูดได้เลยครับ พูดแทรกได้ตลอดเวลา"
-SEARCH_FILLER = "ขอค้นข้อมูลสักครู่นะครับ"
+# หลายแบบกันจำเจ — สุ่มเลือกทุกครั้งที่เริ่มระบบ (greet()) แต่ยังคงความหมายเดิมไว้
+GREETINGS_MALE = (
+    "สวัสดีครับ ผมพร้อมคุยแล้ว พูดได้เลยครับ พูดแทรกได้ตลอดเวลา",
+    "สวัสดีครับ ผมฟังอยู่ครับ พูดมาได้เลย พูดแทรกได้ตลอดเวลานะครับ",
+    "หวัดดีครับ พร้อมคุยแล้วครับ อยากถามอะไรพูดได้เลยครับ",
+    "สวัสดีครับ วันนี้มีอะไรให้ช่วยไหมครับ พูดแทรกได้ตลอดเวลาเลย",
+)
+GREETINGS_FEMALE = (
+    "สวัสดีค่ะ ดิฉันพร้อมคุยแล้ว พูดได้เลยค่ะ พูดแทรกได้ตลอดเวลา",
+    "สวัสดีค่ะ ดิฉันฟังอยู่ค่ะ พูดมาได้เลย พูดแทรกได้ตลอดเวลานะคะ",
+    "หวัดดีค่ะ พร้อมคุยแล้วค่ะ อยากถามอะไรพูดได้เลยค่ะ",
+    "สวัสดีค่ะ วันนี้มีอะไรให้ช่วยไหมคะ พูดแทรกได้ตลอดเวลาเลย",
+)
+
+
+def greeting_text(gender: str) -> str:
+    return random.choice(GREETINGS_FEMALE if gender == "female" else GREETINGS_MALE)
+
+
+def search_filler_text(gender: str) -> str:
+    return "ขอค้นข้อมูลสักครู่นะคะ" if gender == "female" else "ขอค้นข้อมูลสักครู่นะครับ"
+
+
+def fallback_text(gender: str) -> str:
+    if gender == "female":
+        return "ขอโทษค่ะ ดิฉันยังหาคำตอบให้ไม่ได้ ลองถามใหม่อีกครั้งได้ไหมคะ"
+    return "ขอโทษครับ ผมยังหาคำตอบให้ไม่ได้ ลองถามใหม่อีกครั้งได้ไหมครับ"
+
+
 CUT_MARK = " …(ผู้ใช้พูดแทรกตรงนี้ ส่วนท้ายอาจยังไม่ได้ยิน)"
 NO_ANSWER_MARK = "…(ผู้ใช้พูดแทรกก่อนที่จะได้ตอบ)"
 FINDINGS_HEADER = (
@@ -382,7 +410,7 @@ class VoiceChat:
             if self.cfg.tts_enabled and self.cfg.tts_search_filler and not told_waiting:
                 told_waiting = True
                 seq += 1
-                self.enqueue_tts(epoch, seq, SEARCH_FILLER)
+                self.enqueue_tts(epoch, seq, search_filler_text(self.cfg.voice_gender))
             t_tool = time.perf_counter()
             out = self.tools.run(name, args)
             self.log.event(
@@ -460,7 +488,7 @@ class VoiceChat:
 
         # ไม่ได้ข้อความกลับมาเลยและไม่ได้ถูกขัด — อย่างน้อยต้องพูดอะไรสักอย่าง
         if not full.strip() and not interrupted:
-            full = "ขอโทษครับ ผมยังหาคำตอบให้ไม่ได้ ลองถามใหม่อีกครั้งได้ไหมครับ"
+            full = fallback_text(self.cfg.voice_gender)
             if not started:
                 self.console.begin("🤖 AI ", GREEN, role="assistant")
             self.console.write(full)
@@ -533,7 +561,7 @@ class VoiceChat:
         c.line(c._c(GREEN + "\033[1m", "  คุยกับ AI ด้วยเสียง แบบเรียลไทม์"))
         c.note(f"  LLM  {self.cfg.chat_model}")
         c.note(f"  ASR  {self.cfg.asr_model}")
-        c.note(f"  TTS  {self.cfg.tts_model}"
+        c.note(f"  TTS  {self.cfg.tts_label}"
                + ("" if self.cfg.tts_enabled else "  (ปิดเสียงอยู่)"))
         c.note("  เน็ต  ค้นข้อมูลปัจจุบันได้ (DuckDuckGo)" if self.cfg.web_search
                else "  เน็ต  ปิดอยู่ — ตอบจากความรู้ในโมเดลเท่านั้น")
@@ -542,13 +570,14 @@ class VoiceChat:
         c.line()
 
     def greet(self) -> None:
+        greeting = greeting_text(self.cfg.voice_gender)
         self.console.begin("🤖 AI ", GREEN, role="assistant")
-        self.console.write(GREETING)
+        self.console.write(greeting)
         self.console.end()
-        self.log.turn("assistant", GREETING, epoch=0, greeting=True)
-        self.messages.append({"role": "assistant", "content": GREETING})
+        self.log.turn("assistant", greeting, epoch=0, greeting=True)
+        self.messages.append({"role": "assistant", "content": greeting})
         if self.cfg.tts_enabled:
-            self.enqueue_tts(0, 0, GREETING)
+            self.enqueue_tts(0, 0, greeting)
             while self._tts_busy() or (self.speaker and self.speaker.pending()):
                 time.sleep(0.05)
 
@@ -701,7 +730,7 @@ def selftest(cfg: Config) -> int:
     ok = True
     sample = "สวัสดีครับ วันนี้อากาศที่กรุงเทพเป็นอย่างไรบ้าง"
     try:
-        console.note(f"[1/3] TTS ({cfg.tts_model}) ...")
+        console.note(f"[1/3] TTS ({cfg.tts_label}) ...")
         t0 = time.perf_counter()
         pcm = api.synthesize(sample, cfg.mic_sr)
         console.line(f"      ✓ ได้เสียง {pcm.size / cfg.mic_sr:.2f}s "
@@ -752,6 +781,13 @@ def main() -> int:
     p.add_argument("--headphones", action="store_true",
                    help="ใช้หูฟัง: ปิดระบบกันเสียงลำโพงย้อนเข้าไมค์ (พูดแทรกไวขึ้น)")
     p.add_argument("--no-tts", action="store_true", help="ไม่ต้องออกเสียง แสดง caption อย่างเดียว")
+    p.add_argument("--tts-backend", choices=("api", "edge"), default=None,
+                   help="ทับค่า TTS_BACKEND: api = TTS_MODEL บนเซิร์ฟเวอร์ · "
+                        "edge = Microsoft Edge (เลือกเสียงไทยได้ เสียงคงที่ทุกก้อน)")
+    p.add_argument("--voice", default=None,
+                   help="เสียงของ Edge TTS เช่น th-TH-NiwatNeural (เปิดโหมด edge ให้อัตโนมัติ)")
+    p.add_argument("--list-voices", action="store_true",
+                   help="แสดงรายชื่อเสียงภาษาไทยของ Microsoft Edge")
     p.add_argument("--no-mic", action="store_true", help="โหมดพิมพ์ ไม่ใช้ไมโครโฟน")
     p.add_argument("--no-web", action="store_true", help="ปิดการค้นข้อมูลจากอินเทอร์เน็ต")
     p.add_argument("--mic-gain", type=float, default=None,
@@ -768,6 +804,13 @@ def main() -> int:
 
     if args.list_devices:
         print(list_devices())
+        return 0
+
+    if args.list_voices:
+        from vc.tts_edge import THAI_VOICES
+        print("เสียงภาษาไทยของ Microsoft Edge (ใช้กับ --voice หรือ EDGE_TTS_VOICE):")
+        for name, label, _gender in THAI_VOICES:
+            print(f"  {name:<26} {label}")
         return 0
 
     cfg = load_config()
@@ -789,6 +832,12 @@ def main() -> int:
         cfg.tts_single_request = False
     if args.one_voice:
         cfg.tts_single_request = True
+    if args.tts_backend:
+        cfg.tts_backend = args.tts_backend
+    if args.voice:
+        # ระบุเสียงมาแต่ยังอยู่แบ็กเอนด์ api จะไม่มีผลอะไรเลย — สลับให้เลย
+        cfg.edge_voice = args.voice
+        cfg.tts_backend = "edge"
     cfg.input_device = args.input_device
     cfg.output_device = args.output_device
 

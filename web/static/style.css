@@ -808,6 +808,24 @@ body {
 
 .btn.ghost { border-color: transparent; background: transparent; }
 
+/* ปุ่มที่ห่อ <select> ไว้ข้างใน — ให้ dropdown ดูเป็นปุ่มเดียวกับตัวอื่นในแถบ */
+.btn.picker { padding-inline-end: 9px; cursor: pointer; }
+.btn.picker:has(select:disabled) { opacity: 0.35; cursor: not-allowed; }
+
+.btn.picker select {
+  max-width: 210px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-family: var(--thai);
+  font-size: 15px;
+  cursor: inherit;
+  outline: none;
+}
+
+/* รายการที่กางออกมาวาดโดยระบบปฏิบัติการ ไม่รับสีโปร่งใสของธีม จึงต้องระบุพื้นทึบ */
+.btn.picker option { background: var(--panel-solid); color: var(--text); }
+
 .controls { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* ช่องพิมพ์ */
