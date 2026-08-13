@@ -5,20 +5,59 @@
 """
 from __future__ import annotations
 
-import argparse
 import threading
 import time
 
 import numpy as np
 
-from vc.api import ApiClient, ApiError
+from vc.chat import VoiceChat
 from vc.config import Config
+from vc.options import RuntimeOptions
+from vc.phase import TurnPhase
+from vc.selftest import run_selftest
 from vc.vad import VoiceGate
-from voice_chat import VoiceChat, greeting_text
 
 from .bridge import Outbox, WebConsole, WebMic, WebSpeaker
 
+# ตรวจระบบใช้โค้ดชุดเดียวกับ CLI แล้ว (P3-21) — ชื่อเดิมยัง import จากที่นี่ได้
+__all__ = ["WebSession", "run_selftest", "LEVEL_INTERVAL", "MAX_TEXT_CHARS",
+           "MAX_AUDIO_BYTES", "CLIENT_MESSAGES"]
+
 LEVEL_INTERVAL = 0.1      # ส่งระดับเสียงให้ UI วาดมิเตอร์ ~10 ครั้ง/วินาที
+
+# ─────────────────────────────────────────── เพดาน/ชนิดของข้อความจาก client (P2-11)
+# ไม่มีอะไรที่ client ส่งมาที่เชื่อถือได้ ทุกค่าต้องผ่านการตรวจก่อนใช้เสมอ
+MAX_TEXT_CHARS = 4096         # ข้อความที่พิมพ์แทนการพูด
+MAX_AUDIO_BYTES = 96_000      # ~3 วินาทีที่ 16 kHz/int16 (ปกติเบราว์เซอร์ส่ง 640 ไบต์)
+CLIENT_MESSAGES = frozenset({"played", "level", "text", "interrupt",
+                             "mute", "tts_voice", "echo_guard", "clear", "quit"})
+
+
+def _as_int(value: object) -> int | None:
+    """แปลงเป็น int แบบไม่โยน exception — คืน None ถ้าค่าไม่ใช่จำนวนเต็มที่ใช้ได้"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        out = int(value)
+    except (TypeError, ValueError, OverflowError):   # "abc", NaN, inf
+        return None
+    return out if 0 <= out < 1 << 31 else None
+
+
+def _as_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out == out and abs(out) != float("inf") else None   # กัน NaN/inf
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(value)
 
 # เหตุการณ์ที่ส่งต่อให้หน้าเว็บโชว์เป็นตัวเลข latency (ตัวเนื้อความไม่ต้องส่งซ้ำ)
 METRIC_EVENTS = {"asr", "tts", "message", "interrupt", "tool",
@@ -28,16 +67,15 @@ METRIC_SKIP = {"text", "spoken", "audio_file", "meta", "sources"}
 
 class WebSession(VoiceChat):
     def __init__(self, cfg: Config, out: Outbox):
-        args = argparse.Namespace(
-            no_mic=False, greet=True, save_audio=cfg.save_audio,
-            headphones=not cfg.echo_guard, no_tts=not cfg.tts_enabled,
-        )
-        super().__init__(cfg, args, console=WebConsole(out))
+        # ไม่ต้องปลอม argparse.Namespace อีกแล้ว — แกนกลางประกาศสัญญาของตัวเองไว้
+        super().__init__(cfg, RuntimeOptions(no_mic=False, greet=True),
+                         console=WebConsole(out))
         self.out = out
         self.mic = WebMic(cfg.mic_sr, cfg.frame_ms)
         self.speaker = WebSpeaker(out, cfg.speaker_sr)
         self._level_at = 0.0
         self._closed = threading.Event()
+        self.bad_messages = 0        # ข้อความจาก client ที่ผิดรูปแล้วถูกข้าม (P2-11)
         self._forward_metrics()
 
     def _forward_metrics(self) -> None:
@@ -80,6 +118,11 @@ class WebSession(VoiceChat):
         threading.Thread(target=self._tts_worker, name="tts", daemon=True).start()
 
     # ---------------------------------------------------------------- callbacks
+    def _on_phase_change(self, old: TurnPhase, new: TurnPhase) -> None:
+        """ส่ง phase จริงขึ้นไปให้ UI ด้วย เพื่อไม่ต้องเดาจาก icon ของสถานะ (P2-5)"""
+        super()._on_phase_change(old, new)
+        self.out.json("phase", value=new.value, prev=old.value)
+
     def _on_speech_start(self) -> None:
         self.out.json("speech", state="start")
         super()._on_speech_start()
@@ -97,27 +140,72 @@ class WebSession(VoiceChat):
         self.out.json("level", rms=round(level, 4), threshold=round(threshold, 4))
 
     # ------------------------------------------------------- ข้อความจากเบราว์เซอร์
+    def _bad(self, why: str, **fields) -> None:
+        """ข้อความจาก client ผิดรูป — บันทึกแล้วข้ามไป ห้ามปิด session (P2-11)"""
+        self.bad_messages += 1
+        self.log.event("bad_client_message", reason=why,
+                       total=self.bad_messages, **fields)
+
     def feed_audio(self, data: bytes) -> None:
-        assert self.mic is not None
-        if len(data) >= 2:
-            self.mic.feed(np.frombuffer(data, dtype="<i2"))
+        """รับเฟรมเสียงดิบจากเบราว์เซอร์ — ตรวจให้ครบก่อนแปลงเป็น int16
+
+        `np.frombuffer(..., "<i2")` โยน ValueError ทันทีถ้าจำนวนไบต์เป็นเลขคี่
+        ซึ่งเดิมทะลุขึ้นไปถึงลูป transport แล้วปิด session ทั้งอันทิ้ง
+        """
+        if self.mic is None or not data:
+            return
+        if len(data) % 2 or len(data) < 2:
+            self._bad("audio_frame_odd_length", size=len(data))
+            return
+        if len(data) > MAX_AUDIO_BYTES:
+            self._bad("audio_frame_too_large", size=len(data))
+            return
+        try:
+            frame = np.frombuffer(data, dtype="<i2")
+        except (ValueError, TypeError) as exc:
+            self._bad("audio_frame_unreadable", size=len(data), error=repr(exc))
+            return
+        self.mic.feed(frame)
 
     def handle_client(self, msg: dict) -> None:
-        assert self.speaker is not None
+        """ข้อความควบคุมจากเบราว์เซอร์ — ตรวจทีละ field ไม่เชื่อค่าที่ส่งมาเลย"""
+        if self.speaker is None:
+            return
         kind = msg.get("type")
+        if not isinstance(kind, str) or kind not in CLIENT_MESSAGES:
+            self._bad("unknown_type", detail=str(kind)[:40])
+            return
+
         if kind == "played":
-            self.speaker.note_played(int(msg.get("epoch", 0)), int(msg.get("seq", 0)))
+            epoch, seq = _as_int(msg.get("epoch")), _as_int(msg.get("seq"))
+            if epoch is None or seq is None:
+                self._bad("played_bad_ids", epoch=str(msg.get("epoch"))[:40],
+                          seq=str(msg.get("seq"))[:40])
+                return
+            self.speaker.note_played(epoch, seq)
         elif kind == "level":
-            self.speaker.note_level(float(msg.get("out", 0.0)))
+            rms = _as_float(msg.get("out"))
+            if rms is None:
+                self._bad("level_bad_value", out=str(msg.get("out"))[:40])
+                return
+            self.speaker.note_level(rms)
         elif kind == "text":
-            text = str(msg.get("text", "")).strip()
-            if text:
-                self.events.put(("text", text))
+            raw = msg.get("text")
+            if not isinstance(raw, str):
+                self._bad("text_not_a_string", got=type(raw).__name__)
+                return
+            if len(raw) > MAX_TEXT_CHARS:
+                self._bad("text_too_long", chars=len(raw))
+                raw = raw[:MAX_TEXT_CHARS]
+            text = raw.strip()
+            if text and not self.put_event("text", text):
+                self.log.event("event_dropped", event="text",
+                               total=self.dropped_events)
         elif kind == "interrupt":
-            if self.busy:
+            if self.phase is not TurnPhase.IDLE:
                 self.interrupt("ผู้ใช้กดหยุด")
         elif kind == "mute":
-            self.cfg.tts_enabled = not bool(msg.get("on"))
+            self.cfg.tts_enabled = not _as_bool(msg.get("on"))
             if not self.cfg.tts_enabled:
                 self.interrupt("ปิดเสียง", log_event=False)
             self.out.json("setting", key="mute", on=not self.cfg.tts_enabled)
@@ -130,7 +218,7 @@ class WebSession(VoiceChat):
             self.out.json("setting", key="tts_voice",
                           value=self.cfg.tts_voice_value, label=self.cfg.tts_label)
         elif kind == "echo_guard":
-            self.cfg.echo_guard = bool(msg.get("on"))
+            self.cfg.echo_guard = _as_bool(msg.get("on"))
             self.out.json("setting", key="echo_guard", on=self.cfg.echo_guard)
         elif kind == "clear":
             self.reset_history()
@@ -140,15 +228,27 @@ class WebSession(VoiceChat):
             self.request_stop()
 
     def request_stop(self) -> None:
-        """สั่งปิด session จากฝั่ง asyncio (client ตัดการเชื่อมต่อ/กดออก)"""
+        """สั่งปิด session จากฝั่ง asyncio (client ตัดการเชื่อมต่อ/กดออก)
+
+        ลำดับสำคัญ: ต้อง `interrupt()` (ซึ่ง set `cancel`) **ก่อน** เคลียร์ `running`
+        ไม่งั้นเทิร์นที่กำลังรอ TTS อยู่จะไม่รู้ว่าถูกยกเลิก แล้ววนรอต่อไปเรื่อย ๆ
+        จนเธรดค้างตลอดอายุ process (บั๊กเดิม: ปิดแท็บระหว่าง AI พูด = เธรดรั่ว)
+        """
         self._closed.set()
+        self.interrupt("ปิดการเชื่อมต่อ", log_event=False)   # set cancel + หยุดเสียง
         self.running.clear()
+        self._drain_tts_queue()          # งานที่เพิ่งถูกใส่เข้ามาระหว่างปิด
         if self.mic is not None:
             self.mic.started.set()       # ปลดล็อกกรณีค้างรออยู่ตอน calibrate
-        self.events.put(("quit", None))
+        self.put_event("quit")           # คิวมีเพดาน — put_event ทิ้งของเก่าให้เอง
 
     # --------------------------------------------------------------------- run
     def header(self) -> None:
+        """ข้อมูลตั้งต้นที่ส่งให้หน้าเว็บ
+
+        ห้ามใส่ path ในเครื่อง (log_dir) หรือ endpoint ภายในองค์กร (base_url)
+        ลงใน payload นี้ — ทุก client ที่ต่อเข้ามาอ่านได้หมด (P1-1 ข้อ 4)
+        """
         self.out.json(
             "ready",
             chat_model=self.cfg.chat_model,
@@ -156,14 +256,13 @@ class WebSession(VoiceChat):
             tts_model=self.cfg.tts_model,
             tts_label=self.cfg.tts_label,
             tts_voice=self.cfg.tts_voice_value,
-            base_url=self.cfg.base_url,
+            api_configured=bool(self.cfg.base_url and self.cfg.api_key),
             mic_sr=self.cfg.mic_sr,
             speaker_sr=self.cfg.speaker_sr,
             frame_ms=self.cfg.frame_ms,
             tts_enabled=self.cfg.tts_enabled,
             echo_guard=self.cfg.echo_guard,
             web_search=self.cfg.web_search,
-            log_dir=str(self.log.dir),
         )
 
     def print_help(self) -> None:
@@ -191,53 +290,3 @@ class WebSession(VoiceChat):
             finally:
                 self.out.json("closed")
                 self.out.close()
-
-
-# --------------------------------------------------------------- ตรวจระบบ (onboarding)
-def run_selftest(cfg: Config) -> dict:
-    """เรียก TTS → ASR → LLM ครบวง แล้วคืนผลเป็นโครงสร้างให้หน้าเว็บแสดงทีละขั้น"""
-    api = ApiClient(cfg)
-    sample = "สวัสดีครับ วันนี้อากาศที่กรุงเทพเป็นอย่างไรบ้าง"
-    steps: list[dict] = []
-
-    def add(name: str, model: str, ok: bool, detail: str, ms: int) -> None:
-        steps.append({"name": name, "model": model, "ok": ok,
-                      "detail": detail, "ms": ms})
-
-    try:
-        t0 = time.perf_counter()
-        pcm = api.synthesize(sample, cfg.mic_sr)
-        add("TTS", cfg.tts_label, True,
-            f"สังเคราะห์เสียงได้ {pcm.size / cfg.mic_sr:.2f} วินาที",
-            int((time.perf_counter() - t0) * 1000))
-
-        t0 = time.perf_counter()
-        text = api.transcribe(pcm, cfg.mic_sr)
-        add("ASR", cfg.asr_model, bool(text), text or "ถอดเสียงไม่ได้ข้อความ",
-            int((time.perf_counter() - t0) * 1000))
-
-        t0 = time.perf_counter()
-        cancel = threading.Event()
-        msgs = [{"role": "system", "content": cfg.system_prompt},
-                {"role": "user", "content": text or sample}]
-        out, first = "", None
-        for delta in api.chat_stream(msgs, cancel):
-            if first is None:
-                first = int((time.perf_counter() - t0) * 1000)
-            out += delta
-            if len(out) > 400:
-                cancel.set()
-        add("LLM", cfg.chat_model, first is not None,
-            out.strip()[:160] or "โมเดลไม่ส่งข้อความกลับมา",
-            first or int((time.perf_counter() - t0) * 1000))
-    except ApiError as exc:
-        steps.append({"name": "ผิดพลาด", "model": "", "ok": False,
-                      "detail": str(exc)[:300], "ms": 0})
-    except Exception as exc:  # noqa: BLE001
-        steps.append({"name": "ผิดพลาด", "model": "", "ok": False,
-                      "detail": repr(exc)[:300], "ms": 0})
-    finally:
-        api.close()
-
-    return {"ok": bool(steps) and all(s["ok"] for s in steps), "steps": steps,
-            "greeting": greeting_text(cfg.voice_gender)}

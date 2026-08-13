@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import socket
 import sys
 import threading
@@ -30,6 +31,10 @@ from vc.config import load_config                    # noqa: E402
 PASS, FAIL = 0, 0
 FRAME_MS = 20
 MIC_SR = 16000
+
+# ตั้ง token ให้แน่นอนก่อนเซิร์ฟเวอร์ถูก import (P1-1 — WebSocket ต้องมี token)
+AUTH_TOKEN = "e2e-test-token-0123456789"
+os.environ["WEB_AUTH_TOKEN"] = AUTH_TOKEN
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -128,7 +133,8 @@ def make_speech(api: ApiClient, text: str) -> np.ndarray:
 
 
 async def scenario(port: int, speech: np.ndarray, barge: np.ndarray) -> FakeBrowser:
-    url = f"ws://127.0.0.1:{port}/ws"
+    # ตั้งแต่ P1-1 เซิร์ฟเวอร์ต้องการ token (client นี้ไม่มี Origin เหมือนเบราว์เซอร์)
+    url = f"ws://127.0.0.1:{port}/ws?token={AUTH_TOKEN}"
     async with websockets.connect(url, max_size=8 << 20) as ws:
         br = FakeBrowser(ws)
         task = asyncio.create_task(br.reader())

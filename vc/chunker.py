@@ -12,6 +12,8 @@ import re
 
 STRONG = ".!?…。！？\n:;"
 SOFT = " \t,)]”\"'ๆ"
+# ขอบ "ประโยค" จริง ๆ (แคบกว่า STRONG: ไม่นับ : กับ ; ที่มักอยู่กลางประโยค)
+SENTENCE_END = ".!?…。！？\n"
 
 _MD = re.compile(r"(\*\*|__|\*|`{1,3}|^#{1,6}\s+|^\s*[-•*]\s+|^\s*>\s+)", re.MULTILINE)
 _LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
@@ -53,6 +55,156 @@ def split_for_tts(text: str, limit: int) -> list[str]:
     if text:
         out.append(text)
     return out
+
+
+class ReplyLimiter:
+    """บังคับเพดานความยาวคำตอบระหว่างที่ยังสตรีมอยู่ (P2-15)
+
+    system prompt สั่ง "ไม่เกิน 4 ประโยค" ไว้แล้ว แต่วัดจากบันทึกจริง 126 ข้อความ
+    ได้ p90 = 366 ตัวอักษร และยาวสุด 815 → prompt เดียวเอาไม่อยู่ ต้องบังคับในโค้ด
+
+    วิธีตัดที่ไม่ทำให้ข้อความค้างกลางคำ: ปล่อยข้อความออกได้ทันทีตราบใดที่ยังห่าง
+    จากเพดานเกิน `hold` ตัวอักษร พอเข้าเขตใกล้เพดานจะกลั้นไว้ในบัฟเฟอร์แล้วปล่อย
+    ทีละ "ประโยคที่จบแล้ว" เท่าที่ยังไม่เกินเพดาน ถ้าไม่มีขอบประโยคเลยจนชนเพดาน
+    จึงตัดที่ช่องว่างท้ายสุดที่ยังอยู่ในเพดาน
+
+    ปิดการทำงาน: ตั้ง `max_chars` สูงมาก (เช่น 9999) เพื่อปิดเพดานตัวอักษร และ
+    `max_sentences = 0` เพื่อปิดเพดานจำนวนประโยค
+    """
+
+    def __init__(self, max_sentences: int = 4, max_chars: int = 320,
+                 hold: int = 80):
+        self.max_sentences = max(0, int(max_sentences))
+        self.max_chars = max(0, int(max_chars))
+        self.hold = min(hold, self.max_chars // 2) if self.max_chars else 0
+        self.sentences = 0        # จำนวนประโยคที่ปล่อยออกไปครบแล้ว
+        self.released = 0         # จำนวนตัวอักษรที่ปล่อยออกไปแล้ว
+        self.capped = False       # ถึงเพดานแล้ว (ผู้เรียกควรปิดสตรีม)
+        self._buf = ""
+        self._at_edge = True      # ตอนนี้อยู่ที่รอยต่อประโยคพอดีหรือยัง
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.max_chars or self.max_sentences)
+
+    @property
+    def _budget(self) -> int:
+        """ตัวอักษรที่ยังปล่อยได้อีก (ไม่จำกัดเพดาน = ค่ามหาศาล)"""
+        if not self.max_chars:
+            return 1 << 30
+        return max(0, self.max_chars - self.released)
+
+    def feed(self, delta: str) -> tuple[str, bool]:
+        """รับข้อความที่สตรีมมา — คืน (ส่วนที่ปล่อยออกได้, ถึงเพดานแล้วหรือยัง)"""
+        if self.capped:
+            return "", True
+        if not self.enabled:
+            self.released += len(delta)
+            return delta, False
+        self._buf += delta
+        out: list[str] = []
+        while self._buf and not self.capped:
+            piece = self._take()
+            if piece is None:
+                break
+            out.append(piece)
+        return "".join(out), self.capped
+
+    def flush(self) -> str:
+        """สตรีมจบเอง — ปล่อยส่วนที่กลั้นไว้ออกให้หมด"""
+        if self.capped:
+            self._buf = ""
+            return ""
+        piece, self._buf = self._buf, ""
+        if piece.strip():
+            self.sentences += 1
+        self.released += len(piece)
+        return piece
+
+    # ------------------------------------------------------------------ ภายใน
+    def _take(self) -> str | None:
+        """ปล่อยชิ้นถัดไปที่ปล่อยได้อย่างปลอดภัย — None = ยังต้องรอข้อความเพิ่ม"""
+        buf = self._buf
+        budget = self._budget
+        if budget <= 0:
+            self.capped = True
+            return None
+
+        end = self._sentence_end(buf)
+        if end is not None:
+            if end <= budget:
+                return self._release(end, sentence=True)
+            # ประโยคถัดไปยาวเกินเพดานที่เหลือ
+            if self._at_edge:
+                # ยังไม่ได้ปล่อยเศษของประโยคนี้ออกไป → จบตรงรอยต่อประโยคเดิมได้เลย
+                # (ดีกว่าปล่อยเศษออกไปให้เต็มเพดานแล้วค้างกลางประโยค)
+                self.capped = True
+                self._buf = ""
+                return None
+            # ปล่อยเศษไปแล้วบางส่วน — ตัดที่ขอบคำท้ายสุดที่ยังอยู่ในเพดาน
+            return self._release(self._safe_cut(buf, budget), sentence=True,
+                                 capped=True)
+
+        # ยังไม่เจอขอบประโยคในบัฟเฟอร์
+        safe = budget - self.hold
+        if len(buf) <= safe:
+            return self._release(len(buf))          # ยังห่างเพดาน ปล่อยได้เลย
+        if len(buf) < budget:
+            if safe > 0:
+                return self._release(safe)          # ปล่อยเท่าที่ปลอดภัย รอขอบประโยค
+            return None                             # อยู่ในเขตกลั้น รอต่อ
+        if self._at_edge:
+            # ประโยคก่อนหน้าจบพอดีแล้วและประโยคใหม่ยาวจนไม่มีทางจบในเพดาน
+            # → หยุดตรงรอยต่อประโยคเดิม ดีกว่าปล่อยเศษออกไปค้างกลางประโยค
+            self.capped = True
+            self._buf = ""
+            return None
+        return self._release(self._safe_cut(buf, budget), sentence=True, capped=True)
+
+    def _release(self, n: int, sentence: bool = False,
+                 capped: bool = False) -> str:
+        piece, self._buf = self._buf[:n], self._buf[n:]
+        self.released += len(piece)
+        self._at_edge = sentence
+        if sentence and piece.strip():
+            self.sentences += 1
+            if self.max_sentences and self.sentences >= self.max_sentences:
+                capped = True
+        if capped:
+            self.capped = True
+            self._buf = ""
+        return piece
+
+    @staticmethod
+    def _sentence_end(buf: str) -> int | None:
+        """ตำแหน่งหลังขอบประโยคแรกที่มีเนื้อความนำหน้าจริง (None = ยังไม่มี)"""
+        for i, ch in enumerate(buf):
+            if ch not in SENTENCE_END:
+                continue
+            # จุดทศนิยม/เลขลำดับ ไม่ใช่จบประโยค ("ประมาณ 25.5 องศา")
+            if ch == "." and i and buf[i - 1].isdigit():
+                # SSE แบ่ง delta ตรงไหนก็ได้ ถ้าก้อนจบที่ "25." ต้องรออักขระ
+                # ถัดไปก่อน ไม่งั้นจะนับจุดทศนิยมเป็นจบประโยคและปิด stream เร็วไป
+                if i + 1 >= len(buf):
+                    return None
+                if buf[i + 1].isdigit():
+                    continue
+            if not buf[:i].strip():
+                continue
+            end = i + 1
+            while end < len(buf) and buf[end] in SENTENCE_END:
+                end += 1        # "…" / "?!" / ".\n" นับเป็นขอบเดียว
+            return end
+        return None
+
+    @staticmethod
+    def _safe_cut(buf: str, budget: int) -> int:
+        """จุดตัดท้ายสุดที่ยังไม่เกิน budget และไม่ผ่ากลางคำเท่าที่ทำได้"""
+        window = buf[:budget]
+        for i in range(len(window) - 1, max(0, budget // 3) - 1, -1):
+            if window[i] in SOFT or window[i] in SENTENCE_END:
+                return i + 1
+        return budget
 
 
 class SentenceChunker:

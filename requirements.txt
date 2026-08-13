@@ -2,6 +2,8 @@ httpx>=0.27
 numpy>=1.26
 python-dotenv>=1.0
 sounddevice>=0.4.6
+# Windows ไม่มีฐานข้อมูล IANA timezone มากับระบบ แต่ APP_TZ ใช้ ZoneInfo โดยตรง
+tzdata>=2025.2; sys_platform == "win32"
 
 # --- เฉพาะโหมดเว็บ (web/server.py) ---
 fastapi>=0.110
@@ -12,6 +14,9 @@ uvicorn[standard]>=0.29
 # อ่าน MP3 ได้ในตัว ไม่ต้องติดตั้ง ffmpeg แยก
 edge-tts>=7.0
 soundfile>=0.12
+
+# --- เฉพาะตอนทดสอบ (pytest tests/) ---
+pytest>=8.0
 
 # --- เฉพาะตอนทดสอบด้วยเบราว์เซอร์จริง (tests/test_browser.py) ---
 # ติดตั้งเพิ่มเองเมื่อต้องใช้:

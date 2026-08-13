@@ -1,9 +1,18 @@
-"""ไคลเอนต์เรียก LiteLLM: chat (streaming), ASR, TTS"""
+"""ไคลเอนต์เรียก LiteLLM: chat (streaming), ASR, TTS
+
+**นี่คือขอบเขตจัดการข้อผิดพลาดเพียงจุดเดียวของฝั่ง HTTP (P2-6)** — ทุกความผิดพลาด
+ที่ออกจากไฟล์นี้ต้องเป็น `ApiError` เท่านั้น ห้ามให้ `httpx.*` หลุดขึ้นไปให้ชั้นบน
+ดักเอง (บั๊กเดิม: `httpx.ConnectError` ตอนถอดเสียงทะลุถึง `run()` แล้วปิดทั้ง session)
+พร้อมลองใหม่แบบ exponential backoff + jitter สำหรับความผิดพลาดที่ลองใหม่แล้วมีผล
+"""
 from __future__ import annotations
 
 import io
 import json
+import logging
+import random
 import threading
+import time
 import wave
 from typing import Callable, Iterator
 
@@ -12,9 +21,33 @@ import numpy as np
 
 from .config import Config
 
+log = logging.getLogger("voicechat.api")
+
+# ความผิดพลาดชั่วคราวระดับเครือข่าย — ลองใหม่ได้ (NetworkError ครอบ Connect/Read/
+# Write/CloseError, TimeoutException ครอบ connect/read/write/pool timeout)
+RETRYABLE_EXC = (httpx.TimeoutException, httpx.NetworkError,
+                 httpx.RemoteProtocolError)
+BACKOFF_CAP = 8.0          # เพดานเวลาคอยต่อครั้ง (วินาที)
+
 
 class ApiError(RuntimeError):
     pass
+
+
+def _retryable_status(status: int) -> bool:
+    """429 (โดนจำกัดอัตรา) และ 5xx เท่านั้น — 4xx อื่นลองใหม่ไปก็ผิดเหมือนเดิม"""
+    return status == 429 or status >= 500
+
+
+def _retry_after(response: httpx.Response) -> float | None:
+    """อ่าน `Retry-After` (วินาที) ถ้าเซิร์ฟเวอร์บอกมา"""
+    raw = response.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw.strip()))
+    except ValueError:
+        return None          # รูปแบบวันที่ (HTTP-date) — ใช้ backoff ปกติแทน
 
 
 def _merge_tool_deltas(acc: dict[int, dict], deltas: list[dict]) -> None:
@@ -89,12 +122,63 @@ class ApiClient:
         self._chat.close()
         self._audio.close()
 
+    # ------------------------------------------------ ลองใหม่ + แปลงข้อผิดพลาด
+    def _delay(self, attempt: int, retry_after: float | None) -> float:
+        """เวลาคอยก่อนลองครั้งถัดไป — เคารพ Retry-After ถ้ามี ไม่งั้นเลขคู่ทวี + jitter"""
+        if retry_after is not None:
+            return min(retry_after, BACKOFF_CAP)
+        base = max(0, self.cfg.http_retry_base_ms) / 1000.0
+        # jitter ±20% กันหลาย client ยิงกลับมาพร้อมกันเป็นระลอก
+        return min(BACKOFF_CAP, base * (2 ** attempt) * random.uniform(0.8, 1.2))
+
+    def _can_retry(self, attempt: int) -> bool:
+        return attempt < max(0, self.cfg.http_retry_max)
+
+    def _wait(self, label: str, attempt: int, delay: float, reason: str,
+              cancel: threading.Event | None = None) -> bool:
+        """คอยตาม backoff — คืน False ถ้าถูกสั่งยกเลิกระหว่างคอย"""
+        log.warning("%s ล้มเหลว (%s) — ลองใหม่ครั้งที่ %d ในอีก %.2f วินาที",
+                    label, reason, attempt + 1, delay)
+        if cancel is not None:
+            return not cancel.wait(delay)
+        time.sleep(delay)
+        return True
+
+    def _post(self, client: httpx.Client, url: str, label: str, **kw) -> httpx.Response:
+        """POST ที่ลองใหม่ให้เองและคืนได้เฉพาะผลสำเร็จ (ไม่งั้นโยน ApiError)"""
+        attempt = 0
+        while True:
+            try:
+                r = client.post(url, **kw)
+            except RETRYABLE_EXC as exc:
+                if not self._can_retry(attempt):
+                    raise ApiError(f"{label} เชื่อมต่อไม่สำเร็จ: {exc!r}") from exc
+                self._wait(label, attempt, self._delay(attempt, None), repr(exc))
+                attempt += 1
+                continue
+            except httpx.HTTPError as exc:      # ผิดตั้งแต่รูปแบบคำขอ ลองใหม่ไม่ช่วย
+                raise ApiError(f"{label} เรียกไม่สำเร็จ: {exc!r}") from exc
+            if r.status_code >= 400:
+                if _retryable_status(r.status_code) and self._can_retry(attempt):
+                    self._wait(label, attempt,
+                               self._delay(attempt, _retry_after(r)),
+                               f"HTTP {r.status_code}")
+                    attempt += 1
+                    continue
+                raise ApiError(f"{label} {r.status_code}: {r.text[:300]}")
+            return r
+
     # ------------------------------------------------------------------ chat
     def _stream_once(
         self, messages: list[dict], cancel: threading.Event,
         tools: list[dict] | None, tool_choice: str = "auto",
+        allow_retry: bool = True,
     ) -> Iterator[tuple[str, object]]:
-        """สตรีมหนึ่งรอบ คืนเป็นคู่ ("text", ข้อความ) หรือ ("tool", ชิ้นส่วน tool_call)"""
+        """สตรีมหนึ่งรอบ คืนเป็นคู่ ("text", ข้อความ) หรือ ("tool", ชิ้นส่วน tool_call)
+
+        ลองใหม่ได้เฉพาะตอนที่ **ยังไม่มี token ไหลออกไปเลย** — ถ้าเริ่มพูดแล้วค่อยหลุด
+        การยิงซ้ำจะทำให้ผู้ใช้ได้ยินท่อนเดิมสองครั้ง (AC-6.4)
+        """
         payload: dict = {
             "model": self.cfg.chat_model,
             "messages": messages,
@@ -106,34 +190,65 @@ class ApiClient:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
 
-        with self._chat.stream("POST", "/v1/chat/completions", json=payload) as r:
-            if r.status_code >= 400:
-                r.read()
-                raise ApiError(f"chat {r.status_code}: {r.text[:300]}")
-            for line in r.iter_lines():
-                if cancel.is_set():
-                    return
-                if not line or not line.startswith("data:"):
-                    continue
-                chunk = line[5:].strip()
-                if not chunk or chunk == "[DONE]":
-                    if chunk == "[DONE]":
+        attempt = 0
+        while True:
+            emitted = False
+            retry: tuple[float, str] | None = None
+            try:
+                with self._chat.stream("POST", "/v1/chat/completions",
+                                       json=payload) as r:
+                    if r.status_code >= 400:
+                        r.read()
+                        if (_retryable_status(r.status_code) and allow_retry
+                                and self._can_retry(attempt)):
+                            retry = (self._delay(attempt, _retry_after(r)),
+                                     f"HTTP {r.status_code}")
+                        else:
+                            raise ApiError(f"chat {r.status_code}: {r.text[:300]}")
+                    else:
+                        for line in r.iter_lines():
+                            if cancel.is_set():
+                                return
+                            if not line or not line.startswith("data:"):
+                                continue
+                            chunk = line[5:].strip()
+                            if not chunk or chunk == "[DONE]":
+                                if chunk == "[DONE]":
+                                    return
+                                continue
+                            try:
+                                obj = json.loads(chunk)
+                            except json.JSONDecodeError:
+                                continue
+                            choices = obj.get("choices") or []
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta") or {}
+                            text = delta.get("content")
+                            if text:
+                                emitted = True
+                                yield "text", text
+                            calls = delta.get("tool_calls")
+                            if calls:
+                                emitted = True
+                                yield "tool", calls
                         return
-                    continue
-                try:
-                    obj = json.loads(chunk)
-                except json.JSONDecodeError:
-                    continue
-                choices = obj.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-                text = delta.get("content")
-                if text:
-                    yield "text", text
-                calls = delta.get("tool_calls")
-                if calls:
-                    yield "tool", calls
+            except ApiError:
+                raise
+            except RETRYABLE_EXC as exc:
+                if allow_retry and not emitted and self._can_retry(attempt):
+                    retry = (self._delay(attempt, None), repr(exc))
+                else:
+                    raise ApiError(f"chat สตรีมขาดกลางทาง: {exc!r}") from exc
+            except httpx.HTTPError as exc:
+                raise ApiError(f"chat เรียกไม่สำเร็จ: {exc!r}") from exc
+
+            if retry is None:
+                return
+            delay, reason = retry
+            if not self._wait("chat", attempt, delay, reason, cancel):
+                return                     # ถูกพูดแทรกระหว่างคอย — เลิกยิงต่อ
+            attempt += 1
 
     def chat_stream(
         self, messages: list[dict], cancel: threading.Event,
@@ -162,8 +277,10 @@ class ApiClient:
             choice = "auto" if rnd < max_rounds else "none"
             calls: dict[int, dict] = {}
             said = ""
+            # พูดออกไปแล้วห้ามยิงซ้ำ ไม่งั้นผู้ใช้ได้ยินท่อนเดิมสองครั้ง (AC-6.4)
             for kind, payload in self._stream_once(
-                    msgs, cancel, tools if can_use else None, choice):
+                    msgs, cancel, tools if can_use else None, choice,
+                    allow_retry=not spoke):
                 if kind == "text":
                     said += payload  # type: ignore[operator]
                     spoke = True
@@ -207,7 +324,8 @@ class ApiClient:
         if used_tools and not spoke and not cancel.is_set():
             msgs.append({"role": "user",
                          "content": "ตอบคำถามเดิมสั้น ๆ จากข้อมูลที่ค้นมาได้เลย"})
-            for kind, payload in self._stream_once(msgs, cancel, None):
+            for kind, payload in self._stream_once(msgs, cancel, None,
+                                                   allow_retry=False):
                 if kind == "text":
                     yield payload  # type: ignore[misc]
 
@@ -216,13 +334,12 @@ class ApiClient:
         wav = pcm16_to_wav(pcm, samplerate)
         files = {"file": ("speech.wav", wav, "audio/wav")}
         data = {"model": self.cfg.asr_model}
-        r = self._audio.post("/v1/audio/transcriptions", files=files, data=data)
-        if r.status_code >= 400:
-            raise ApiError(f"asr {r.status_code}: {r.text[:300]}")
+        r = self._post(self._audio, "/v1/audio/transcriptions", "asr",
+                       files=files, data=data)
         try:
             return (r.json().get("text") or "").strip()
-        except json.JSONDecodeError:
-            raise ApiError(f"asr ตอบกลับผิดรูปแบบ: {r.text[:200]}")
+        except (json.JSONDecodeError, AttributeError, ValueError):
+            raise ApiError(f"asr ตอบกลับผิดรูปแบบ: {r.text[:200]}") from None
 
     # ------------------------------------------------------------------- tts
     def synthesize(self, text: str, dst_sr: int) -> np.ndarray:
@@ -243,11 +360,14 @@ class ApiClient:
             )
 
         payload = {"model": self.cfg.tts_model, "input": text}
-        r = self._audio.post("/v1/audio/speech", json=payload)
-        if r.status_code >= 400:
-            raise ApiError(f"tts {r.status_code}: {r.text[:300]}")
+        r = self._post(self._audio, "/v1/audio/speech", "tts", json=payload)
         body = r.content
         if body[:4] != b"RIFF":
             raise ApiError(f"tts ไม่ได้คืนเสียง: {body[:200]!r}")
-        pcm, sr = wav_to_pcm16(body)
+        try:
+            pcm, sr = wav_to_pcm16(body)
+        except ApiError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — WAV เสียหาย ต้องไม่หลุดเป็นชนิดอื่น
+            raise ApiError(f"tts อ่านไฟล์เสียงไม่ได้: {exc!r}") from exc
         return resample_i16(pcm, sr, dst_sr)
