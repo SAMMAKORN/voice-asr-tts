@@ -94,6 +94,34 @@ def test_body_is_capped(monkeypatch) -> None:
     assert len(out.encode()) < 200_000
 
 
+def test_compressed_body_is_rejected_before_decompression(monkeypatch) -> None:
+    """gzip bomb ต้องไม่ถูกคลายทั้งก้อนก่อนตรวจ FETCH_MAX_BYTES"""
+    read = {"bytes": 0}
+    accept_encodings: list[str] = []
+
+    def compressed_payload():
+        read["bytes"] += 1024
+        yield b"not-really-gzip" * 64
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        accept_encodings.append(request.headers.get("accept-encoding", ""))
+        return httpx.Response(
+            200,
+            headers={**HTML, "content-encoding": "gzip"},
+            content=compressed_payload(),
+        )
+
+    monkeypatch.setattr(websearch, "_is_public", lambda host: True)
+    with pytest.raises(websearch.SearchError) as err:
+        websearch.fetch_page(
+            "http://public.example/bomb", max_bytes=10_000,
+            transport=transport(handler))
+
+    assert "บีบอัด" in str(err.value)
+    assert read["bytes"] == 0, "อ่าน body ก่อนปฏิเสธ Content-Encoding"
+    assert accept_encodings == ["identity"]
+
+
 def test_fetch_max_bytes_env_is_used(monkeypatch) -> None:
     monkeypatch.setenv("FETCH_MAX_BYTES", "2048")
     assert websearch._max_bytes() == 2048
@@ -156,6 +184,26 @@ def test_slow_drip_stops_within_total_budget(monkeypatch) -> None:
 
     assert "ไม่ทัน" in str(err.value)
     assert elapsed < 3.0, f"ใช้เวลา {elapsed:.1f} วินาที ทั้งที่งบเวลา 1 วินาที"
+
+
+def test_redirect_request_uses_only_the_remaining_time_budget(monkeypatch) -> None:
+    """redirect ใหม่ต้องไม่เริ่ม timeout เต็มก้อนอีกครั้ง"""
+    read_timeouts: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        read_timeouts.append(request.extensions["timeout"]["read"])
+        if request.url.path == "/first":
+            time.sleep(0.55)
+            return httpx.Response(302, headers={"location": "/second"})
+        return page()
+
+    monkeypatch.setattr(websearch, "_is_public", lambda host: True)
+    websearch.fetch_page(
+        "http://public.example/first", timeout=1.0,
+        transport=transport(handler))
+
+    assert len(read_timeouts) == 2
+    assert 0 < read_timeouts[1] < 0.6, read_timeouts
 
 
 # ───────────────────────────────────────────────────────────────────── AC-3.6

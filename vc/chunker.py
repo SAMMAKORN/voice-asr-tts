@@ -182,9 +182,13 @@ class ReplyLimiter:
             if ch not in SENTENCE_END:
                 continue
             # จุดทศนิยม/เลขลำดับ ไม่ใช่จบประโยค ("ประมาณ 25.5 องศา")
-            if (ch == "." and i and buf[i - 1].isdigit()
-                    and i + 1 < len(buf) and buf[i + 1].isdigit()):
-                continue
+            if ch == "." and i and buf[i - 1].isdigit():
+                # SSE แบ่ง delta ตรงไหนก็ได้ ถ้าก้อนจบที่ "25." ต้องรออักขระ
+                # ถัดไปก่อน ไม่งั้นจะนับจุดทศนิยมเป็นจบประโยคและปิด stream เร็วไป
+                if i + 1 >= len(buf):
+                    return None
+                if buf[i + 1].isdigit():
+                    continue
             if not buf[:i].strip():
                 continue
             end = i + 1

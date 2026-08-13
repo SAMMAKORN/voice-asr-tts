@@ -58,6 +58,17 @@ def test_decimal_point_is_not_a_sentence_end() -> None:
     assert out.strip() == "อุณหภูมิ 25.5 องศาครับ."
 
 
+def test_decimal_split_between_stream_deltas_is_not_a_sentence_end() -> None:
+    """SSE อาจจบ delta หลังจุดของ `25.` ก่อนเลข 5 จะมาถึง"""
+    limiter = ReplyLimiter(max_sentences=1, max_chars=320)
+    first, first_capped = limiter.feed("อุณหภูมิ 25.")
+    second, second_capped = limiter.feed("5 องศาครับ. ประโยคที่สองไม่ควรออก.")
+
+    assert first_capped is False
+    assert second_capped is True
+    assert (first + second).strip() == "อุณหภูมิ 25.5 องศาครับ."
+
+
 def test_sentence_cap_stops_after_n_sentences() -> None:
     limiter = ReplyLimiter(max_sentences=2, max_chars=9999)
     out = run("หนึ่งครับ. สองครับ. สามครับ. สี่ครับ.", limiter)

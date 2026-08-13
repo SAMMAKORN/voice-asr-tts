@@ -12,6 +12,7 @@ import secrets
 import sys
 import threading
 import traceback
+from html import escape
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -138,7 +139,7 @@ def session_config() -> Config:
 async def index() -> HTMLResponse:
     """ฝัง session token ลงหน้าเว็บตอนเสิร์ฟ — client แนบกลับมาทุกคำขอ"""
     html = (STATIC / "index.html").read_text(encoding="utf-8")
-    html = html.replace(TOKEN_PLACEHOLDER, session_token())
+    html = html.replace(TOKEN_PLACEHOLDER, escape(session_token(), quote=True))
     return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 

@@ -281,8 +281,11 @@ class Config:
         """
         # ต้องระบุ timezone: บน container ที่ TZ=UTC `datetime.now()` เปล่าให้เวลา
         # เพี้ยนไป 7 ชั่วโมง แล้วโมเดลตอบเรื่อง "ตอนนี้" ผิดวันไปเลย (P3-20)
-        stamp_at = self.now()
-        where = "ตามเวลาประเทศไทย" if self.tz == DEFAULT_TZ else f"ตามเขตเวลา {self.tz}"
+        active_zone = zone(self.tz)
+        active_name = active_zone.key
+        stamp_at = now(active_zone)
+        where = ("ตามเวลาประเทศไทย" if active_name == DEFAULT_TZ
+                 else f"ตามเขตเวลา {active_name}")
         stamp = (f"ตอนนี้คือ{THAI_DAYS[stamp_at.weekday()]}ที่ {stamp_at.day} "
                  f"{THAI_MONTHS[stamp_at.month - 1]} พ.ศ. {stamp_at.year + 543} "
                  f"(ค.ศ. {stamp_at.year}) เวลา {stamp_at:%H:%M} น. {where}")
@@ -352,6 +355,8 @@ def load_config() -> Config:
         raise SystemExit(f"ไม่พบค่าใน .env: {', '.join(missing)}")
 
     w: list[str] = []
+    raw_tz = (os.environ.get("APP_TZ") or "").strip() or DEFAULT_TZ
+    resolved_tz = zone(raw_tz).key
     cfg = Config(
         warnings=w,
         base_url=base,
@@ -386,7 +391,7 @@ def load_config() -> Config:
         reply_max_sentences=_i("REPLY_MAX_SENTENCES", 4, w),
         reply_max_chars=_i("REPLY_MAX_CHARS", 320, w),
         keep_findings=_i("KEEP_FINDINGS", 4, w),
-        tz=(os.environ.get("APP_TZ") or "").strip() or DEFAULT_TZ,
+        tz=resolved_tz,
         log_dir=log_dir(),
         log_transcript=_b("LOG_TRANSCRIPT", True, w),
         log_retention_days=_i("LOG_RETENTION_DAYS", 0, w),

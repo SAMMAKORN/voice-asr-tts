@@ -236,6 +236,7 @@ chmod 600 .env        # กันผู้ใช้อื่นบนเคร�
   | ปลายทาง | ต้องเป็น IP สาธารณะ — บล็อก localhost, IP วง LAN, link-local (รวม `169.254.169.254`) และ IPv4-mapped IPv6 |
   | จำนวน redirect | ตามได้ไม่เกิน 3 ครั้ง และตรวจที่อยู่ปลายทางใหม่ทุกครั้ง เกินแล้วคืน `too many redirects` |
   | ขนาดที่ดาวน์โหลด | หยุดอ่านเมื่อถึง `FETCH_MAX_BYTES` (ค่าเริ่มต้น 512000 ไบต์) แล้วปิดการเชื่อมต่อทันที |
+  | การบีบอัด | ขอ `Accept-Encoding: identity` และปฏิเสธ response ที่ยังส่ง `Content-Encoding` แบบบีบอัด เพื่อกัน decompression bomb ขยายเกินเพดานในหน่วยความจำ |
   | ชนิดเนื้อหา | ตรวจจาก header ก่อนอ่านเนื้อหา ยอมเฉพาะ `text/*`, `application/xhtml+xml`, `application/json` |
   | เวลารวม | `SEARCH_TIMEOUT` เป็นงบเวลารวมทั้งคำขอ (นับข้าม redirect และระหว่างอ่านเนื้อหา) |
 

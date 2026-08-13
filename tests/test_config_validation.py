@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from vc import config as config_mod
-from vc.config import RANGES, Config, check_combinations, load_config
+from vc.config import DEFAULT_TZ, RANGES, Config, check_combinations, load_config
 
 pytestmark = pytest.mark.unit
 
@@ -27,7 +27,7 @@ def clean_env(monkeypatch):
     monkeypatch.setattr(config_mod, "load_dotenv", lambda *a, **k: False)
     monkeypatch.setattr(config_mod, "_warned", set())
     for key in (*RANGES, *BOOL_KEYS, "LOG_DIR", "LANG_HINT", "SYSTEM_PROMPT",
-                "CHAT_MODEL", "ASR_MODEL", "TTS_MODEL"):
+                "CHAT_MODEL", "ASR_MODEL", "TTS_MODEL", "APP_TZ"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("API_BASE_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("API_KEY", "test-key")
@@ -63,6 +63,14 @@ def test_boolean_keys_reject_nonsense_without_crashing(clean_env) -> None:
     cfg = load_config()
     assert cfg.web_search is True, "ค่าที่อ่านไม่ออกต้องกลับไปใช้ค่าปริยาย"
     assert any("WEB_SEARCH" in w for w in cfg.warnings)
+
+
+def test_unknown_timezone_is_normalized_to_the_real_fallback(clean_env, capsys) -> None:
+    clean_env.setenv("APP_TZ", "Invalid/Config_Zone")
+    cfg = load_config()
+
+    assert cfg.tz == DEFAULT_TZ
+    assert "APP_TZ" in capsys.readouterr().err
 
 
 # ────────────────────────────────────────────── ค่านอกช่วง (AC-19.3)

@@ -43,6 +43,16 @@ def test_unknown_zone_falls_back_with_a_warning(monkeypatch, capsys) -> None:
     assert "APP_TZ" in capsys.readouterr().err
 
 
+def test_unknown_zone_prompt_names_the_fallback_not_the_bad_value(capsys) -> None:
+    bad_zone = "Invalid/Prompt_Zone"
+    cfg = Config(tz=bad_zone, web_search=False)
+    content = cfg.system_message()["content"]
+
+    assert "ตามเวลาประเทศไทย" in content
+    assert bad_zone not in content
+    assert "APP_TZ" in capsys.readouterr().err
+
+
 def test_machine_tz_does_not_change_the_answer(monkeypatch) -> None:
     """AC-20.1 — ตั้ง TZ=UTC ให้ process แล้วเวลาที่ระบบใช้ต้องยังเป็นเวลาไทย"""
     monkeypatch.setenv("TZ", "UTC")
@@ -175,3 +185,11 @@ def test_startup_under_utc_env_still_reports_thai_time() -> None:
                          capture_output=True, text=True,
                          env={"TZ": "UTC", "PATH": "/usr/bin:/bin"})
     assert out.stdout.strip() == "+0700"
+
+
+def test_windows_declares_the_timezone_database_dependency() -> None:
+    requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert re.search(
+        r"(?mi)^tzdata[^\n;]*;[^\n]*sys_platform\s*==\s*[\"']win32[\"']",
+        requirements,
+    ), "Windows ไม่มี IANA timezone database จึงต้องติดตั้ง tzdata โดยตรง"

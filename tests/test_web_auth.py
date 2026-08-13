@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+from html import escape
 
 import pytest
 from fastapi.testclient import TestClient
@@ -139,6 +140,18 @@ def test_index_embeds_session_token(client) -> None:
     html = client.get("/").text
     assert server.TOKEN_PLACEHOLDER not in html
     assert f'content="{TOKEN}"' in html
+
+
+def test_index_escapes_a_user_configured_token(client, monkeypatch) -> None:
+    special = 'abc"&<script>window.pwned=1</script>'
+    monkeypatch.setenv("WEB_AUTH_TOKEN", special)
+    monkeypatch.setattr(server, "_token", None)
+
+    page = client.get("/").text
+
+    assert f'content="{escape(special, quote=True)}"' in page
+    assert "<script>window.pwned=1</script>" not in page
+    assert server.token_ok(special)
 
 
 # ───────────────────────────────────────────────────────────────────── AC-1.5

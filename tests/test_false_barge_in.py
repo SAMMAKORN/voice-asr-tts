@@ -79,6 +79,13 @@ def test_nothing_spoken_yet_means_no_echo_match() -> None:
     assert noise_reason("ครับ", "", barged=True) is None
 
 
+def test_nothing_spoken_yet_means_no_wrong_language_guess() -> None:
+    """เคสจริงจาก session log: ถูกขัดก่อนเสียงแรกออก แล้ว ASR เดาคำพูดจริงเป็น
+    ภาษาอื่นมั่ว ๆ (เช่น "để quay chân.") — ไม่มีเสียงอะไรให้สะท้อน จึงต้องไม่ทิ้ง
+    """
+    assert noise_reason("để quay chân.", "", barged=True) is None
+
+
 def test_normalise_ignores_punctuation_and_spacing() -> None:
     assert normalise(" ครับ! ") == normalise("ครับ")
     assert normalise("") == ""
@@ -112,6 +119,20 @@ def test_real_interruption_is_not_counted(web_session, monkeypatch) -> None:
     _turn(web_session, "เดี๋ยวก่อนครับ ผมอยากถามอีกเรื่อง", barged=True)
     assert web_session.false_barge_ins == 0
     assert calls == ["เดี๋ยวก่อนครับ ผมอยากถามอีกเรื่อง"]
+
+
+def test_barge_in_before_any_audio_played_still_gets_a_response(
+        web_session, monkeypatch) -> None:
+    """เคสจริงจาก session log: ถูกขัดก่อนเสียงแรกออก (`_last_spoken` ว่าง) แล้ว ASR
+    เดาคำพูดจริงเป็นภาษาอื่นมั่ว ๆ — ต้องได้รับคำตอบ ไม่ใช่ถูกทิ้งเงียบ ๆ
+    """
+    web_session._last_spoken = ""
+    calls: list[str] = []
+    monkeypatch.setattr(web_session, "respond",
+                        lambda epoch, cancel, text: calls.append(text))
+    _turn(web_session, "để quay chân.", barged=True)
+    assert web_session.false_barge_ins == 0
+    assert calls == ["để quay chân."]
 
 
 def test_reason_is_recorded_in_the_log(web_session) -> None:

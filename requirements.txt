@@ -2,6 +2,8 @@ httpx>=0.27
 numpy>=1.26
 python-dotenv>=1.0
 sounddevice>=0.4.6
+# Windows ไม่มีฐานข้อมูล IANA timezone มากับระบบ แต่ APP_TZ ใช้ ZoneInfo โดยตรง
+tzdata>=2025.2; sys_platform == "win32"
 
 # --- เฉพาะโหมดเว็บ (web/server.py) ---
 fastapi>=0.110

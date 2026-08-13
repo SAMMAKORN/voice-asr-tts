@@ -289,13 +289,22 @@ def fetch_page(url: str, max_chars: int = 3000, timeout: float = 12.0,
 
     limits = httpx.Timeout(connect=min(CONNECT_TIMEOUT, max(1.0, timeout)),
                            read=timeout, write=timeout, pool=timeout)
-    client = httpx.Client(timeout=limits, follow_redirects=False,
-                          transport=transport, headers={"User-Agent": UA})
+    client = httpx.Client(
+        timeout=limits,
+        follow_redirects=False,
+        transport=transport,
+        # ขอเนื้อหาดิบเท่านั้น เพื่อให้ FETCH_MAX_BYTES เป็นเพดานหน่วยความจำจริง
+        # `iter_bytes()` ของ httpx จะคลาย gzip ก่อนคืน chunk ซึ่งเปิดทางให้ zip bomb
+        headers={"User-Agent": UA, "Accept-Encoding": "identity"},
+    )
     try:
         for hop in range(MAX_HOPS + 1):
-            left()
+            remain = left()
+            # timeout ต้องหดตามงบรวมที่เหลือ ไม่ใช่เริ่มนับ `timeout` ใหม่ทุก redirect
+            request_timeout = httpx.Timeout(
+                remain, connect=min(CONNECT_TIMEOUT, remain))
             try:
-                with client.stream("GET", target) as r:
+                with client.stream("GET", target, timeout=request_timeout) as r:
                     if r.is_redirect:
                         location = r.headers.get("location", "")
                         if hop >= MAX_HOPS:
@@ -314,14 +323,26 @@ def fetch_page(url: str, max_chars: int = 3000, timeout: float = 12.0,
                         raise SearchError(
                             "ลิงก์นี้ไม่ใช่หน้าเว็บที่อ่านเป็นข้อความได้"
                             + (f" ({ctype.split(';')[0]})" if ctype else ""))
+                    content_encoding = (
+                        r.headers.get("content-encoding", "").strip().lower())
+                    if content_encoding not in ("", "identity"):
+                        # ตรวจ header ก่อนอ่าน body แม้แต่ไบต์เดียว: เซิร์ฟเวอร์ที่ไม่ทำตาม
+                        # Accept-Encoding: identity อาจส่ง gzip bomb ที่ขยายใหญ่กว่า cap มาก
+                        raise SearchError(
+                            "หน้าเว็บส่งเนื้อหาแบบบีบอัดแม้ขอ identity "
+                            f"({content_encoding}) จึงไม่อ่านเพื่อความปลอดภัย")
                     body = bytearray()
-                    # ไม่กำหนดขนาดก้อน — `iter_bytes(n)` จะสะสมจนครบ n ก่อนคืน
-                    # ทำให้เป้าหมายที่ส่งข้อมูลทีละไบต์ยืดเวลาได้เกินงบที่ตั้งไว้
+                    # ไม่ระบุ chunk_size: ถ้าบังคับให้สะสมก้อนใหญ่ slow-drip จะค้าง
+                    # อยู่ใน iterator จน deadline ไม่มีโอกาสถูกตรวจ
+                    # หลังปฏิเสธ Content-Encoding แล้ว iter_bytes() จะไม่คลายข้อมูล
+                    # เพิ่ม และยังรองรับ MockTransport/response ที่ buffer มาแล้ว
                     for chunk in r.iter_bytes():
                         left()
-                        body += chunk
-                        if len(body) >= cap:
-                            del body[cap:]
+                        room = cap - len(body)
+                        if room <= 0:
+                            break
+                        body.extend(chunk[:room])
+                        if len(chunk) >= room:
                             break           # ออกจาก with = ปิดคอนเนกชันทันที
                     html = bytes(body).decode(r.encoding or "utf-8", errors="replace")
                     break

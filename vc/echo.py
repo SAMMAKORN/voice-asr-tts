@@ -48,6 +48,11 @@ def noise_reason(text: str, spoken: str = "", *, lang_hint: str = "th",
         return TOO_SHORT
     if not barged:
         return None
+    if not spoken:
+        # AI ยังไม่ได้พูดอะไรออกลำโพงเลยในเทิร์นนี้ (เช่นถูกขัดก่อนเสียงแรกจะออก)
+        # จึงไม่มีเสียงให้สะท้อนกลับมา ข้อความแปลก ๆ ที่ ASR เดามาต้องเป็นคำพูด
+        # จริงของผู้ใช้ (ต่อให้ถอดออกมาไม่ตรง) ไม่ใช่เสียงสะท้อนของ AI เอง
+        return None
     if (len(t) < FOREIGN_MAX_CHARS and lang_hint.startswith("th")
             and not THAI_CHARS.search(t)):
         return WRONG_LANGUAGE
