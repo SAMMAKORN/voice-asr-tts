@@ -148,6 +148,18 @@ function controls(on) {
   }
 }
 
+/* ปุ่ม "เริ่มระบบ" สลับหน้าที่เป็นปุ่มหยุดตอนกำลังทำงาน (running=true) —
+   เดิมปุ่มถูก disabled ทันทีที่ต่อติด ผู้ใช้เลยไม่มีทางหยุดระบบทั้งชุดได้เลย
+   นอกจาก "■ หยุด" ซึ่งแค่ตัดเสียง AI ที่กำลังพูด ไม่ได้ปิดเซสชัน/ไมค์ */
+function setStartButton(running, label) {
+  const btn = $('btn-start');
+  btn.disabled = false;
+  btn.dataset.running = running ? '1' : '0';
+  btn.classList.toggle('danger', running);
+  btn.classList.toggle('primary', !running);
+  btn.textContent = running ? '■ หยุดระบบ' : (label || 'เริ่มระบบ');
+}
+
 // ───────────────────────────────────────────────────────── ธีมหน้าจอ
 /* ธีมถูก apply ไปแล้วโดย inline script ใน <head> (กันหน้าจอกระพริบ)
    ที่นี่ดูแลแค่ปุ่มสลับ, การจำค่าที่เลือก และการตามธีมของระบบ */
@@ -488,6 +500,7 @@ function stopPlayback() {
    จึงต้องแทรกเส้นคั่นบอกให้ชัด ไม่ปล่อยให้ผู้ใช้เข้าใจผิดว่ามันยังจำได้ */
 const RETRY_DELAYS = [500, 1000, 2000, 4000, 8000, 15000];
 const R = { tries: 0, timer: 0, countdown: 0, wanted: false };
+let manualStop = false;   // ผู้ใช้กดปุ่มหยุดเอง ไม่ใช่หลุดเพราะเน็ตปัญหา — ไม่ต้องเชื่อมต่อใหม่
 
 function reconnectSoon() {
   if (!R.wanted || R.timer) return;
@@ -497,8 +510,7 @@ function reconnectSoon() {
               'ลองใหม่อัตโนมัติครบแล้ว — กด “เชื่อมต่อใหม่” เพื่อลองอีกครั้ง');
     showAlert('เชื่อมต่อเซิร์ฟเวอร์ไม่ได้หลังลองใหม่ '
               + RETRY_DELAYS.length + ' ครั้ง กดปุ่ม “เชื่อมต่อใหม่” เพื่อลองอีกครั้ง');
-    $('btn-start').disabled = false;
-    $('btn-start').textContent = 'เชื่อมต่อใหม่';
+    setStartButton(false, 'เชื่อมต่อใหม่');
     return;
   }
   const wait = RETRY_DELAYS[R.tries];
@@ -559,17 +571,25 @@ function connect() {
 
   ws.onclose = () => {
     live = false;
+    ws = null;
     stopPlayback();
     controls(false);
     setOrb('idle');
+    if (manualStop) {
+      manualStop = false;
+      setLink('0', 'หยุดแล้ว');
+      setStatus('หยุดระบบแล้ว', 'กด “เริ่มระบบ” เพื่อเริ่มใหม่');
+      setStartButton(false);
+      addLog('หยุดระบบแล้ว (กดปุ่มหยุดเอง)');
+      return;
+    }
     if (R.wanted) {
       reconnectSoon();
       return;
     }
     setLink('0', 'หลุดการเชื่อมต่อ');
     setStatus('การเชื่อมต่อหลุด', 'กด “เชื่อมต่อใหม่” เพื่อเริ่มต่อใหม่');
-    $('btn-start').disabled = false;
-    $('btn-start').textContent = 'เชื่อมต่อใหม่';
+    setStartButton(false, 'เชื่อมต่อใหม่');
   };
 
   ws.onerror = () => addLog('เชื่อมต่อ WebSocket ไม่สำเร็จ', 'error');
@@ -611,8 +631,7 @@ function handleJson(m) {
         $('chip-tts').textContent = m.tts_label || m.tts_model;
       }
       controls(true);
-      $('btn-start').textContent = '● ทำงานอยู่';
-      $('btn-start').disabled = true;
+      setStartButton(true);
       sessions++;
       if (sessions > 1) markMemoryReset();   // session ใหม่ = ความจำเริ่มใหม่ (P2-9)
       // ไม่แสดง path ของ log แล้ว — เซิร์ฟเวอร์ไม่ส่งออกมาให้ client อีกต่อไป (P1-1)
@@ -671,7 +690,7 @@ function handleJson(m) {
       writeMsg(m.text);
       break;
 
-    case 'end':    endMsg(m.interrupted ? 'ถูกพูดขัด' : ''); break;
+    case 'end':    endMsg(m.note); break;
 
     case 'sources': showSources(m.items); break;
 
@@ -834,8 +853,32 @@ async function start() {
   connect();
 }
 
+/* กดปุ่มเดียวกันตอนกำลังทำงาน = หยุดทั้งระบบ (ปิด WebSocket, เลิกส่งเสียง)
+   ต่างจาก "■ หยุด" ซึ่งแค่ตัดเสียง AI ที่กำลังพูดแล้วฟังต่อได้ทันที */
+function stopSystem() {
+  R.wanted = false;
+  if (R.timer) { clearTimeout(R.timer); R.timer = 0; }
+  if (R.countdown) { clearInterval(R.countdown); R.countdown = 0; }
+  R.tries = 0;
+  manualStop = true;
+  if (ws) {
+    ws.close();                // ws.onclose ทำความสะอาด UI ให้เมื่อ manualStop เป็นจริง
+  } else {
+    manualStop = false;
+    stopPlayback();
+    controls(false);
+    setOrb('idle');
+    setLink('0', 'หยุดแล้ว');
+    setStatus('หยุดระบบแล้ว', 'กด “เริ่มระบบ” เพื่อเริ่มใหม่');
+    setStartButton(false);
+  }
+}
+
 // ───────────────────────────────────────────────────────── ปุ่มต่าง ๆ
-$('btn-start').addEventListener('click', start);
+$('btn-start').addEventListener('click', () => {
+  if ($('btn-start').dataset.running === '1') stopSystem();
+  else start();
+});
 
 $('btn-stop').addEventListener('click', () => {
   stopPlayback();

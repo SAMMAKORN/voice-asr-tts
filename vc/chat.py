@@ -66,6 +66,9 @@ GREETING = GREETINGS_MALE[0]
 SEARCH_FILLER = search_filler_text("male")
 CUT_MARK = " …(ผู้ใช้พูดแทรกตรงนี้ ส่วนท้ายอาจยังไม่ได้ยิน)"
 NO_ANSWER_MARK = "…(ผู้ใช้พูดแทรกก่อนที่จะได้ตอบ)"
+# เหตุผลเดียวที่ถือว่าเป็น "ถูกพูดขัด" จริง ๆ (มีคนพูดทับ) — เหตุผลอื่นทั้งหมด
+# (กดปุ่มหยุด, กด Enter เปล่า, ปิดเสียง, ปิดโปรแกรม, ...) คือผู้ใช้สั่งหยุดเอง
+BARGE_IN_REASON = "ผู้ใช้พูดแทรก"
 FINDINGS_HEADER = (
     "ข้อมูลที่คุณค้นเจอไปแล้วก่อนหน้านี้ในบทสนทนาเดียวกัน "
     "ใช้ตอบต่อได้เลยโดยไม่ต้องค้นซ้ำ ถ้าผู้ใช้ถามย้ำเรื่องเดิม:\n\n")
@@ -118,6 +121,7 @@ class VoiceChat:
         self.dropped_events = 0         # เหตุการณ์ที่ถูกทิ้งเพราะคิวเต็ม (P2-11)
         self.utterance_no = 0
         self._barged = False            # เทิร์นล่าสุดถูกตัดเพราะ VAD จับว่ามีคนพูด
+        self._interrupt_reason = ""     # เหตุผลของการ interrupt() ครั้งล่าสุด (ดู respond())
         self._last_reply: dict | None = None   # ไว้กู้คืนถ้าที่ตัดไปเป็นเสียงหลอน
         self._last_spoken = ""          # ข้อความที่ออกลำโพงไปแล้วจริงในเทิร์นก่อน
         self.false_barge_ins = 0        # จำนวนครั้งที่ยืนยันว่าไม่ใช่การพูดแทรกจริง
@@ -257,7 +261,7 @@ class VoiceChat:
         """
         if self.phase in BARGE_IN_PHASES:
             self._barged = True
-            self.interrupt("ผู้ใช้พูดแทรก")
+            self.interrupt(BARGE_IN_REASON)
 
     def _on_utterance(self, pcm: np.ndarray) -> None:
         if not self.put_event("utterance", pcm):
@@ -265,6 +269,7 @@ class VoiceChat:
                            total=self.dropped_events)
 
     def interrupt(self, reason: str, log_event: bool = True) -> None:
+        self._interrupt_reason = reason
         self.cancel.set()
         if self.speaker is not None:
             self.speaker.stop()
@@ -685,7 +690,11 @@ class VoiceChat:
         # เก็บ "สิ่งที่ผู้ใช้ได้ยินจริง" ไว้เทียบกับเสียงที่อาจสะท้อนกลับเข้าไมค์ (P3-23)
         self._last_spoken = spoken
         if started:
-            self.console.end("  ⟨ถูกพูดขัด⟩" if interrupted else "")
+            # "ถูกพูดขัด" เฉพาะตอนมีคนพูดทับจริง ๆ — ถูกสั่งหยุด (ปุ่มหยุด/กด Enter/
+            # ปิดเสียง/ปิดโปรแกรม ฯลฯ) ไม่ใช่การพูดขัด ป้ายต้องบอกว่า "ถูกหยุดพูด"
+            label = ("ถูกพูดขัด" if self._interrupt_reason == BARGE_IN_REASON
+                     else "ถูกหยุดพูด")
+            self.console.end(f"  ⟨{label}⟩" if interrupted else "")
         self.console.clear_status()
 
         # ไม่ได้ข้อความกลับมาเลยและไม่ได้ถูกขัด — อย่างน้อยต้องพูดอะไรสักอย่าง
