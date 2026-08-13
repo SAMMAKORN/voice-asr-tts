@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import sys
@@ -92,18 +93,74 @@ def test_logger_uses_the_config_zone(tmp_path) -> None:
 
 
 # ────────────────────────────────────────────────── กันการถอยหลัง (AC-20.2)
-SOURCES = [p for p in ROOT.rglob("*.py")
-           if ".claude" not in p.parts and "tests" not in p.parts]
+# ระบุโฟลเดอร์ให้ชัด ห้าม ROOT.rglob(): บนเครื่องที่ทำตาม README แล้วมี .venv/
+# อยู่ในโปรเจกต์ มันจะกวาด site-packages เข้ามาแล้วฟ้องโค้ดของ pydantic/pytest
+# ส่วนบน path ที่มี `.claude` จะได้ลิสต์ว่างแล้วผ่านทั้งที่ไม่ได้ตรวจอะไรเลย
+SOURCES = ([p for folder in ("web", "vc") for p in (ROOT / folder).rglob("*.py")]
+           + [ROOT / "voice_chat.py"])
+
+
+def naive_time_calls(source: str) -> list[tuple[int, str]]:
+    """หาการอ่านเวลาแบบไม่ระบุ timezone จาก AST — ไม่ใช่จากข้อความดิบ
+
+    ต้องดูที่ AST เพราะการค้นด้วย regex ทีละบรรทัดแยกไม่ออกว่าอะไรเป็นโค้ดจริง
+    อะไรเป็นคอมเมนต์/docstring ที่ *เตือน* ว่าห้ามใช้ `datetime.now()` เปล่า
+    (vc/config.py มีทั้งสองแบบ และเคยถูกฟ้องผิดมาแล้ว)
+    """
+    bad: list[tuple[int, str]] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _dotted(node.func)
+        no_args = not node.args and not node.keywords
+        if name.endswith("datetime.now") and no_args:
+            bad.append((node.lineno, f"{name}()"))
+        elif name.endswith("utcnow"):
+            bad.append((node.lineno, f"{name}()"))
+        elif name.endswith("time.localtime") and no_args:
+            bad.append((node.lineno, f"{name}()"))
+    return sorted(bad)
+
+
+def _dotted(node: ast.AST) -> str:
+    """ชื่อแบบจุดของสิ่งที่ถูกเรียก เช่น `datetime.now`, `time.localtime`"""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def test_the_source_list_is_not_empty() -> None:
+    """กันเทสต์ข้างล่างผ่านเพราะไม่มีไฟล์ให้ตรวจ"""
+    assert SOURCES, "ไม่พบไฟล์ต้นฉบับให้ตรวจเลย"
+    assert (ROOT / "vc" / "config.py") in SOURCES
+
+
+def test_the_checker_catches_the_real_thing() -> None:
+    """ตัวตรวจต้อง trigger จริง ไม่ใช่แค่คืนลิสต์ว่างเสมอ"""
+    assert naive_time_calls("from datetime import datetime\nx = datetime.now()\n")
+    assert naive_time_calls("import datetime\nx = datetime.datetime.utcnow()\n")
+    assert naive_time_calls("import time\nx = time.localtime()\n")
+
+
+def test_the_checker_ignores_prose_that_merely_mentions_it() -> None:
+    """docstring/คอมเมนต์ที่ห้ามใช้ `datetime.now()` ไม่ใช่การละเมิด"""
+    assert naive_time_calls('"""ห้ามใช้ `datetime.now()` เปล่า"""\n') == []
+    assert naive_time_calls("# datetime.now() เปล่าให้เวลาเพี้ยน\n") == []
+    assert naive_time_calls('BAD = "datetime.utcnow()"\n') == []
+    # ของที่ถูกต้องก็ต้องไม่ถูกฟ้อง
+    assert naive_time_calls("datetime.now(zone(tz))\ntime.localtime(0)\n") == []
 
 
 def test_no_naive_datetime_now_anywhere_in_the_source() -> None:
     """AC-20.2 — `datetime.now()` เปล่าไม่มีสิทธิ์อยู่ในโปรเจกต์นี้อีก"""
-    bad = []
-    for path in SOURCES:
-        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if re.search(r"datetime\.now\(\s*\)|datetime\.utcnow\(|"
-                         r"time\.localtime\(\s*\)", line):
-                bad.append(f"{path.relative_to(ROOT)}:{i}: {line.strip()}")
+    assert SOURCES
+    bad = [f"{path.relative_to(ROOT)}:{line}: {call}"
+           for path in SOURCES
+           for line, call in naive_time_calls(path.read_text(encoding="utf-8"))]
     assert bad == [], "พบการอ่านเวลาแบบไม่ระบุ timezone:\n" + "\n".join(bad)
 
 

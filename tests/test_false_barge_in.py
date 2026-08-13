@@ -152,22 +152,41 @@ def test_microphone_counts_dropped_frames() -> None:
 
 
 # ────────────────────────────────────────────────────────── dead code (AC-23.2)
-SOURCES = [p for p in ROOT.rglob("*.py")
-           if ".claude" not in p.parts and "tests" not in p.parts]
+# ต้องระบุโฟลเดอร์ให้ชัด ห้ามใช้ ROOT.rglob() — ไม่งั้นบนเครื่องที่ทำตาม README
+# (`python3 -m venv .venv`) จะกวาด .venv/lib/.../site-packages เข้ามาเป็นพันไฟล์
+# แล้วฟ้อง dead code ของไลบรารีคนอื่น ส่วนบน path ที่มี `.claude` จะได้ลิสต์ว่าง
+# แล้วผ่านแบบไม่ได้ตรวจอะไรเลย (เหมือน tests/test_layering.py ที่ทำถูกอยู่แล้ว)
+SOURCES = ([p for folder in ("web", "vc") for p in (ROOT / folder).rglob("*.py")]
+           + [ROOT / "voice_chat.py"])
 
 
-@pytest.mark.parametrize("pattern", ["\\.paused", "queued_seconds", "def sources("])
+def test_the_source_list_is_not_empty() -> None:
+    """กันเทสต์ข้างล่างผ่านเพราะไม่มีไฟล์ให้ตรวจ"""
+    assert SOURCES, "ไม่พบไฟล์ต้นฉบับให้ตรวจเลย"
+    assert (ROOT / "vc" / "chat.py") in SOURCES
+
+
+# `def sources(` ไม่อยู่ในลิสต์นี้: vc/websearch.py:sources() ถูกเรียกจริงจาก
+# tests/test_search.py (คืนกลับมาใน 6641a42) จึงไม่ใช่ dead code อีกแล้ว
+@pytest.mark.parametrize("pattern", ["\\.paused", "queued_seconds"])
 def test_dead_code_is_gone(pattern: str) -> None:
     """AC-23.2 — ของที่ไม่มีผู้เรียกต้องไม่เหลืออยู่"""
     import re
 
+    assert SOURCES
     hits = [f"{p.relative_to(ROOT)}:{i}"
             for p in SOURCES
             for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
             if re.search(pattern, line)]
-    # vc/ui.py:Console.sources และ web/bridge.py:WebConsole.sources ถูกเรียกจริง
-    hits = [h for h in hits if not h.startswith(("vc/ui.py", "web/bridge.py"))]
     assert hits == [], f"ยังเหลือ dead code: {hits}"
+
+
+@pytest.mark.parametrize("pattern", ["\\.paused", "queued_seconds"])
+def test_the_dead_code_patterns_are_valid_regexes(pattern: str) -> None:
+    """`def sources(` เคยหลุดเข้าลิสต์ทั้งที่ compile ไม่ผ่าน (วงเล็บไม่ได้ escape)"""
+    import re
+
+    re.compile(pattern)
 
 
 def test_unused_colour_import_is_gone() -> None:
