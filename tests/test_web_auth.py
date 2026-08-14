@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 import threading
 import time
 from html import escape
 
+import httpx
 import pytest
 import websockets
 from fastapi.testclient import TestClient
@@ -69,8 +71,10 @@ def live_server(monkeypatch, cfg):
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
 
+    # server_header=False ต้องตรงกับที่ main() ใช้จริง ไม่งั้นเทสต์ Server header
+    # จะทดสอบคอนฟิกของเทสต์เอง ไม่ใช่ของโปรดักชัน
     srv = uvicorn.Server(uvicorn.Config(server.app, host="127.0.0.1", port=port,
-                                        log_level="error"))
+                                        log_level="error", server_header=False))
     thread = threading.Thread(target=srv.run, daemon=True)
     thread.start()
     for _ in range(200):                      # รอให้พอร์ตเปิดจริงก่อนคืนค่า
@@ -94,6 +98,7 @@ def client(monkeypatch, cfg):
     monkeypatch.delenv("WEB_ALLOWED_ORIGINS", raising=False)
     monkeypatch.delenv("WEB_PORT", raising=False)
     monkeypatch.setattr(server, "_token", None)          # ให้อ่าน env ใหม่
+    monkeypatch.setattr(server, "_live", {})             # store ของ token ที่หมุน
     monkeypatch.setattr(server, "session_config", lambda: cfg)
     monkeypatch.setattr(server, "WebSession", FakeSession)
     FakeSession.created.clear()
@@ -106,6 +111,38 @@ def client(monkeypatch, cfg):
         monkeypatch.delenv(key, raising=False)
     with TestClient(server.app) as c:
         yield c
+
+
+@pytest.fixture
+def rotating_client(monkeypatch, cfg):
+    """เหมือน `client` แต่ **ไม่** ตั้ง WEB_AUTH_TOKEN
+
+    คือโหมดปริยายจริงของแอป: token หมุนใหม่ทุกครั้งที่โหลดหน้าเว็บ
+    (ตั้ง WEB_AUTH_TOKEN = เลือกให้คงที่ ซึ่งเทสต์อื่นทั้งไฟล์ครอบไว้แล้ว)
+    """
+    monkeypatch.delenv("WEB_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("WEB_ALLOWED_ORIGINS", raising=False)
+    monkeypatch.delenv("WEB_PORT", raising=False)
+    monkeypatch.setattr(server, "_token", None)
+    monkeypatch.setattr(server, "_live", {})
+    monkeypatch.setattr(server, "session_config", lambda: cfg)
+    monkeypatch.setattr(server, "WebSession", FakeSession)
+    monkeypatch.setattr(server, "_active", 0)
+    FakeSession.created.clear()
+    server.STATS.update(sessions_created=0, rejected=0, rate_limited=0)
+    server.LIMITER.reset()
+    for key in ("WEB_RATE_LIMIT", "WEB_SELFTEST_LIMIT", "WEB_RATE_WINDOW_S",
+                "WEB_MAX_SESSIONS", "WEB_TRUST_PROXY", "WEB_TOKEN_TTL_S"):
+        monkeypatch.delenv(key, raising=False)
+    with TestClient(server.app) as c:
+        yield c
+
+
+def page_token(res) -> str:
+    """token ที่หน้าเว็บฝังมาใน meta tag — ตัวเดียวกับที่ app.js อ่านไปใช้"""
+    hit = re.search(r'name="session-token" content="([^"]*)"', res.text)
+    assert hit, "หน้าเว็บไม่มี meta session-token"
+    return hit.group(1)
 
 
 # ───────────────────────────────────────────────────────────── AC-1.1 / AC-1.2
@@ -197,6 +234,85 @@ def test_secure_flag_follows_the_scheme(client) -> None:
     res = client.get("/", headers={"X-Forwarded-Proto": "https"})
     assert "secure" in res.headers["set-cookie"].lower(), (
         "อยู่หลัง reverse proxy ที่ terminate TLS ต้องยังตั้ง Secure ให้")
+
+
+# ──────────────────────────────────────────── token หมุนต่อ session (C-01)
+def test_each_page_load_gets_a_fresh_token(rotating_client) -> None:
+    """เดิม token เดียวต่อ process: รั่วครั้งเดียวใช้ได้จนกว่าจะรีสตาร์ตเซิร์ฟเวอร์"""
+    first = page_token(rotating_client.get("/"))
+    second = page_token(rotating_client.get("/"))
+
+    assert first and second and first != second, "token ไม่ได้หมุน"
+    assert server.token_ok(first) and server.token_ok(second)
+
+
+def test_meta_and_cookie_carry_the_same_token(rotating_client) -> None:
+    """แจก token สองรอบใน index() จะทำให้ /ws กับ /api/* ถือคนละใบ"""
+    res = rotating_client.get("/")
+    assert res.cookies[server.WS_TOKEN_COOKIE] == page_token(res)
+
+
+def test_an_open_tab_survives_a_new_tab_opening(rotating_client) -> None:
+    """เปิดแท็บที่สองต้องไม่เตะแท็บแรกออก — แท็บแรกยังเรียก /api/* ได้อยู่"""
+    old = page_token(rotating_client.get("/"))
+    rotating_client.get("/")                     # แท็บที่สองหมุน token ใหม่
+
+    res = rotating_client.get("/api/config", headers={"X-Session-Token": old})
+    assert res.status_code == 200
+
+
+def test_an_expired_token_is_rejected_everywhere(rotating_client) -> None:
+    """หมดอายุแล้วต้องใช้ไม่ได้ทั้ง /api/* และ /ws (ไม่ใช่แค่ถูกกวาดออกจาก dict)"""
+    token = page_token(rotating_client.get("/"))
+    assert server.token_ok(token)
+
+    # ย้อนวันหมดอายุให้เป็นอดีต — TTL ต่ำสุดคือ 60 วินาที รอจริงไม่ได้
+    server._live[token] = time.monotonic() - 1
+
+    assert server.token_ok(token) is False
+    assert server.live_token_count() == 0, "token ที่หมดอายุต้องถูกกวาดทิ้ง"
+    assert rotating_client.get(
+        "/api/config", headers={"X-Session-Token": token}).status_code == 401
+    with pytest.raises(WebSocketDisconnect) as err:
+        with rotating_client.websocket_connect(f"/ws?token={token}") as ws:
+            ws.receive_json()
+    assert err.value.code == 1008
+    assert server.STATS["sessions_created"] == 0
+
+
+def test_using_a_token_extends_its_life(rotating_client) -> None:
+    """เซสชันที่ยังคุยอยู่ต้องไม่หมดอายุกลางทาง — ใช้งานได้ = ต่ออายุ (sliding)"""
+    token = page_token(rotating_client.get("/"))
+    server._live[token] = time.monotonic() + 5      # เหลืออีก 5 วินาที
+
+    assert server.token_ok(token)                   # การใช้งานหนึ่งครั้ง
+
+    left = server._live[token] - time.monotonic()
+    assert left > 60, f"อายุไม่ถูกต่อใหม่ (เหลือ {left:.0f} วินาที)"
+
+
+def test_the_token_store_cannot_grow_without_bound(rotating_client, monkeypatch) -> None:
+    """GET / ไม่ต้องมีสิทธิ์ — ยิงรัวต้องไม่ทำให้ dict โตไม่จำกัด"""
+    monkeypatch.setattr(server, "TOKEN_MAX", 8)
+
+    tokens = [page_token(rotating_client.get("/")) for _ in range(20)]
+
+    assert server.live_token_count() == 8
+    assert server.token_ok(tokens[-1]), "ใบล่าสุดต้องยังใช้ได้"
+    assert server.token_ok(tokens[0]) is False, "ใบเก่าสุดต้องถูกเตะออกไปแล้ว"
+
+
+def test_a_configured_token_stays_fixed(client) -> None:
+    """ตั้ง WEB_AUTH_TOKEN = เลือกความคงที่ (รันหลาย worker ต้องยืนยันข้าม process ได้)"""
+    assert page_token(client.get("/")) == TOKEN
+    assert page_token(client.get("/")) == TOKEN
+    assert server.live_token_count() == 0, "โหมดคงที่ต้องไม่สร้าง token เข้า store"
+
+
+def test_rotated_token_is_not_guessable(rotating_client) -> None:
+    token = page_token(rotating_client.get("/"))
+    assert len(token) >= 43           # secrets.token_urlsafe(32)
+    assert server.token_ok(token[:-1] + ("A" if token[-1] != "A" else "B")) is False
 
 
 # ───────────────────────────────────────────────────────────────────── AC-1.3
@@ -402,6 +518,20 @@ def test_theme_bootstrap_is_not_inline(client) -> None:
     assert "/static/theme-init.js" in page
     assert "<script>" not in page, "ยังมี inline script ค้างอยู่ในหน้า"
     assert client.get("/static/theme-init.js").status_code == 200
+
+
+def test_no_server_header_advertises_the_stack(live_server) -> None:
+    """ไม่ประกาศ "Server: uvicorn" ให้คนสำรวจช่องโหว่อ่านฟรี
+
+    ต้องยิงเข้าเซิร์ฟเวอร์จริง: TestClient ไม่เคยใส่ Server header ให้ตั้งแต่แรก
+    เทสต์ที่ใช้ TestClient จะผ่านตลอดแม้โปรดักชันจะยังประกาศอยู่ (ผ่านแบบไม่ได้ตรวจ
+    อะไรเลย เหมือนกรณีโควตา session ที่หลงทางกันมาแล้ว)
+    """
+    res = httpx.get(f"http://127.0.0.1:{live_server}/", timeout=5)
+
+    assert res.status_code == 200
+    assert "server" not in {k.lower() for k in res.headers}, dict(res.headers)
+    assert res.headers["X-Frame-Options"] == "DENY", "header อื่นต้องยังมาครบ"
 
 
 def test_openapi_schema_is_not_exposed(client) -> None:

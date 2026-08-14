@@ -202,14 +202,35 @@ marking it in the source.
 
 `/ws` and `/api/*` are not open. `web/server.py` checks the `Origin` header against an allowlist
 **before** `ws.accept()` (rejecting after accept still gives an attacker a live socket), and also
-requires a session token. The token is generated per process (`WEB_AUTH_TOKEN` overrides it, which
-you need when running multiple workers) and reaches the client two ways when `index.html` is
-served: substituted into a `<meta>` tag (the browser sends it back as `X-Session-Token` on
-`/api/*`) and set as an `HttpOnly; SameSite=Strict` cookie (the browser sends it automatically on
-the `/ws` handshake). A request with no `Origin` header at all (curl, a native client) is not
-automatically trusted — it still has to present a valid token, and for those `?token=` on the
-WebSocket URL still works as a fallback. The `ready` payload deliberately carries no `log_dir` and
-no `base_url`, only an `api_configured` boolean, because every client that connects can read it.
+requires a session token. `GET /` mints a **fresh token per page load** (`issue_token`) and it
+reaches the client two ways when `index.html` is served: substituted into a `<meta>` tag (the
+browser sends it back as `X-Session-Token` on `/api/*`) and set as an `HttpOnly; SameSite=Strict`
+cookie (the browser sends it automatically on the `/ws` handshake). Both must be the *same* token,
+so `index()` calls `issue_token()` once and reuses the value. A request with no `Origin` header at
+all (curl, a native client) is not automatically trusted — it still has to present a valid token,
+and for those `?token=` on the WebSocket URL still works as a fallback. The `ready` payload
+deliberately carries no `log_dir` and no `base_url`, only an `api_configured` boolean, because
+every client that connects can read it.
+
+Token rotation has a few constraints that are easy to break:
+
+- live tokens are a **set**, not a single value (`_live`, guarded by its own `_live_lock` — reusing
+  `_token_lock` would deadlock, since `token_ok` calls `fixed_token`). Replacing the old token on
+  each page load instead of adding to the set would log every already-open tab out.
+- expiry is **sliding**: `token_ok` extends the deadline on every successful check, so a session
+  that keeps talking never expires mid-call. `WEB_TOKEN_TTL_S` (default 12h) is time since last
+  *use*, not since issue.
+- setting `WEB_AUTH_TOKEN` turns rotation **off** by design and nothing is written to `_live`. It
+  has to: rotated tokens live in one process's memory, so with multiple workers a token minted by
+  worker A cannot be validated by worker B. Fixed-and-shareable vs rotating-and-single-process is
+  the actual trade, not a security regression.
+- `GET /` needs no auth, so it is a token faucet; `TOKEN_MAX` bounds the set and evicts the
+  soonest-to-expire entry. That is the least-recently-used one, so hammering `/` can still evict an
+  idle tab (which then has to reload) — acceptable only because anyone who can reach `/` already
+  receives a working token, so it grants no new access.
+- an expired token closes `/ws` with **1008**, which the frontend special-cases: retrying cannot
+  help (a new token only arrives with a new page load), so `app.js` stops the backoff loop and
+  tells the user to reload instead of counting down through six doomed attempts.
 
 The token deliberately does **not** travel in the WebSocket URL for browsers: query strings land in
 proxy/CDN access logs and `Referer`. Two dead ends are worth not repeating — both are recorded in
@@ -233,6 +254,12 @@ plain `<script src>` with no `defer`, or the theme flashes on every load). `styl
 schema off the public surface. `tests/test_frontend_ui.py` serves the same headers so a CSP that
 breaks the real page fails there — it relaxes `'unsafe-eval'` only because Playwright's
 `wait_for_function` evaluates a string in the page; production must never have it.
+
+The `Server: uvicorn` banner is suppressed with `server_header=False` on `uvicorn.run`, not in
+`SECURITY_HEADERS`: uvicorn *appends* its default headers to whatever the app sent, so setting
+`Server` in the middleware yields two of them instead of overriding. `TestClient` never adds the
+header at all, so the test for this has to run against a real uvicorn (`live_server`) or it passes
+while checking nothing — the same trap as the session-slot test.
 
 Rate limits (`web/server.py`, all optional) guard the expensive paths: `WEB_RATE_LIMIT` per
 `WEB_RATE_WINDOW_S` for `/api/config` and opening `/ws`, a separate stricter `WEB_SELFTEST_LIMIT`
@@ -262,7 +289,8 @@ concerns that are easy to conflate when tuning:
 - network resilience — `HTTP_RETRY_MAX`, `HTTP_RETRY_BASE_MS`
 - tool-calling limits — `SEARCH_*`, `FETCH_MAX_CHARS`, `FETCH_MAX_BYTES`, `TOOL_ROUNDS`,
   `KEEP_FINDINGS`
-- web security — `WEB_ALLOWED_ORIGINS`, `WEB_AUTH_TOKEN`
+- web security — `WEB_ALLOWED_ORIGINS`, `WEB_AUTH_TOKEN`, `WEB_TOKEN_TTL_S` (the last two live in
+  `web/server.py`'s `WEB_RANGES` for the same reason as the rate limits)
 - web rate limits — `WEB_RATE_LIMIT`, `WEB_RATE_WINDOW_S`, `WEB_SELFTEST_LIMIT`,
   `WEB_MAX_SESSIONS`, `WEB_TRUST_PROXY` (these live in `web/server.py`, not the `Config`
   dataclass, because `vc/` must not know about the web mode; their ranges are declared in

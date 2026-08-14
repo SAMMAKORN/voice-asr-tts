@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -31,9 +32,18 @@ sys.meta_path.insert(0, Blocker())
 """
 
 
+# `text=True` เพียว ๆ ให้ parent ถอดรหัส stdout/stderr ด้วย locale.getpreferredencoding()
+# (encoding ของ Windows console เช่น cp874 ภาษาไทย) แต่ลูกเขียนตาม PYTHONIOENCODING
+# ของมันเอง (สืบทอดจาก environment ของ parent) — ถ้าใครตั้ง PYTHONIOENCODING=utf-8 ไว้
+# (เช่น เลี่ยงปัญหา cp874 พิมพ์ ✓/emoji ของสคริปต์เก่าไม่ได้) ลูกจะเขียน UTF-8 แต่ parent
+# ยังถอดด้วย cp874 อยู่ดี ไบต์หลายไบต์ของ UTF-8 ถอดด้วย cp874 ไม่ได้ครบ → decode ล้มใน
+# reader thread เงียบ ๆ แล้ว CompletedProcess.stdout/stderr กลายเป็น None
+# ล็อก encoding ทั้งสองฝั่งเป็น utf-8 เสมอ ไม่พึ่ง locale ของเครื่องที่รันเทสต์
 def run(code: str) -> subprocess.CompletedProcess:
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     return subprocess.run([sys.executable, "-c", BLOCK_SOUNDDEVICE + code],
-                          cwd=ROOT, capture_output=True, text=True)
+                          cwd=ROOT, capture_output=True, text=True,
+                          encoding="utf-8", env=env)
 
 
 # ─────────────────────────────────────────── รันได้บนเครื่องที่ไม่มีอุปกรณ์เสียง (AC-21.1)
@@ -258,8 +268,11 @@ OLD_FLAGS = ["--list-devices", "--selftest", "--mic-check", "--input-device",
 
 def test_cli_keeps_every_flag_it_had() -> None:
     """AC-21.6"""
+    # encoding/env เดียวกับ run() ข้างบน — ข้อความช่วยของ argparse มีภาษาไทย
+    # และ CompletedProcess.stdout ต้องไม่กลายเป็น None เพราะ decode ล้มใน reader thread
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     out = subprocess.run([sys.executable, "voice_chat.py", "--help"], cwd=ROOT,
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, encoding="utf-8", env=env)
     assert out.returncode == 0, out.stderr
     missing = [f for f in OLD_FLAGS if f not in out.stdout]
     assert missing == [], f"argument ที่หายไป: {missing}"
