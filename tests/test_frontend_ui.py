@@ -21,11 +21,22 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from web.server import SECURITY_HEADERS
+
 pytestmark = [pytest.mark.browser]
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "web" / "static"
 TOKEN = "เทสต์-token"
+
+# page.wait_for_function() ของ Playwright เอา "สตริง" ไปรันในหน้าเว็บ ซึ่งนับเป็น
+# eval จึงต้องมี 'unsafe-eval' ไม่งั้นเทสต์ล้มด้วย EvalError ทั้งที่ตัวแอปไม่พัง
+# CSP จริงตั้งใจไม่ใส่ 'unsafe-eval' (โค้ดแอปไม่มี eval/new Function เลย — ล็อกไว้
+# ด้วย test_csp_locks_down_script_sources ใน tests/test_web_auth.py) ผ่อนที่นี่ที่เดียว
+BROWSER_TEST_HEADERS = dict(SECURITY_HEADERS)
+BROWSER_TEST_HEADERS["Content-Security-Policy"] = (
+    SECURITY_HEADERS["Content-Security-Policy"]
+    .replace("script-src 'self'", "script-src 'self' 'unsafe-eval'"))
 
 
 # ──────────────────────────────────────────────────────── เซิร์ฟเวอร์ปลอม
@@ -47,6 +58,16 @@ class FakeServer:
     def _app(self):
         app = FastAPI()
         app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+        # ส่ง security header ชุดเดียวกับ web/server.py จริง (H-02) — ถ้า CSP รัดแน่น
+        # เกินไปจนหน้าเว็บใช้งานไม่ได้ (สคริปต์ตั้งธีม, WebSocket, AudioWorklet)
+        # ต้องพังให้เห็นที่ชุดเทสต์นี้ ไม่ใช่ไปพังบนเครื่องผู้ใช้
+        @app.middleware("http")
+        async def _headers(request, call_next):
+            resp = await call_next(request)
+            for key, value in BROWSER_TEST_HEADERS.items():
+                resp.headers.setdefault(key, value)
+            return resp
 
         @app.get("/")
         async def index() -> HTMLResponse:

@@ -7,19 +7,9 @@
 <!-- เซิร์ฟเวอร์แทนค่านี้ด้วย session token ตอนเสิร์ฟหน้า (web/server.py) -->
 <meta name="session-token" content="__SESSION_TOKEN__">
 <title>VOICE LINK · คุยกับ AI ด้วยเสียง</title>
-<script>
-/* เลือกธีมก่อน paint แรก — ไม่ให้หน้าจอกระพริบธีมผิดตอนโหลด
-   ค่าที่ผู้ใช้เคยเลือกมาก่อนสำคัญกว่าค่าของระบบ */
-(function () {
-  var t = null;
-  try { t = localStorage.getItem('voicelink.theme.v1'); } catch (_) { /* localStorage ถูกปิด */ }
-  if (t !== 'hud' && t !== 'clay') {
-    var light = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
-    t = light ? 'clay' : 'hud';
-  }
-  document.documentElement.dataset.theme = t;
-})();
-</script>
+<!-- ต้องไม่มี defer/async: สคริปต์นี้ตั้งธีมก่อน paint แรก กันหน้าจอกระพริบ
+     แยกเป็นไฟล์เพื่อให้ CSP ไม่ต้องเปิด 'unsafe-inline' ให้ script-src (H-02) -->
+<script src="/static/theme-init.js"></script>
 <link rel="stylesheet" href="/static/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🛰️</text></svg>">
 </head>
