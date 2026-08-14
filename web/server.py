@@ -107,6 +107,17 @@ def request_is_https(request) -> bool:
 _token_lock = threading.Lock()
 _token: str | None = None
 
+# token หมุนใหม่ทุกครั้งที่เสิร์ฟหน้าเว็บ (หนึ่งครั้งที่โหลดหน้า = หนึ่ง token)
+# เดิมเป็น token ตัวเดียวต่อ process: รั่วครั้งเดียวก็ใช้ได้จนกว่าจะรีสตาร์ตเซิร์ฟเวอร์
+# ต้องเก็บได้หลายตัวพร้อมกัน ไม่ใช่แทนที่ตัวเก่า เพราะผู้ใช้เปิดหลายแท็บได้และแต่ละแท็บ
+# ถือ token ของตัวเอง — ถ้าโหลดแท็บใหม่แล้วตัวเก่าตายทันที แท็บที่เปิดค้างจะหลุดหมด
+_live_lock = threading.Lock()            # แยกจาก _token_lock: Lock ไม่ reentrant
+_live: dict[str, float] = {}             # token → เวลาหมดอายุ (นาฬิกา monotonic)
+
+# เพดานจำนวน token ที่ถืออยู่พร้อมกัน — GET / ไม่ต้องมีสิทธิ์ ใครยิงรัวก็สร้าง token
+# ได้เรื่อย ๆ ถ้าไม่มีเพดาน dict จะโตไม่จำกัด (ตั้งสูงพอที่การใช้งานจริงไม่มีทางแตะ)
+TOKEN_MAX = 2048
+
 # ตัวนับไว้ยืนยันใน test/log ว่า connection ที่ถูกปฏิเสธไม่ได้สร้าง WebSession จริง
 STATS = {"sessions_created": 0, "rejected": 0, "rate_limited": 0}
 
@@ -115,14 +126,46 @@ _active_lock = threading.Lock()
 _active = 0
 
 
-def session_token() -> str:
-    """token ประจำ process — ตั้ง WEB_AUTH_TOKEN เองได้เมื่อรันหลาย worker"""
+def fixed_token() -> str | None:
+    """token คงที่ที่ผู้ดูแลตั้งเอง (WEB_AUTH_TOKEN) — ตั้งไว้แล้วจะไม่หมุนเลย
+
+    จำเป็นเมื่อรันหลาย worker: token ที่หมุนถูกเก็บในหน่วยความจำของ process เดียว
+    worker ตัวอื่นจึงยืนยันไม่ผ่าน การตั้งค่านี้คือการเลือก "คงที่แต่ใช้ร่วมกันได้"
+    แทน "หมุนแต่ใช้ได้ process เดียว" — ไม่ใช่ค่าที่ลืมตั้งแล้วเสียความปลอดภัย
+    """
     global _token
     with _token_lock:
         if _token is None:
-            _token = (os.environ.get("WEB_AUTH_TOKEN") or "").strip() \
-                or secrets.token_urlsafe(32)
-        return _token
+            _token = (os.environ.get("WEB_AUTH_TOKEN") or "").strip()
+        return _token or None
+
+
+def _prune_tokens(now: float) -> None:
+    """ทิ้ง token ที่หมดอายุ — ต้องถูกเรียกใต้ `_live_lock` เสมอ"""
+    for dead in [t for t, exp in _live.items() if exp <= now]:
+        del _live[dead]
+
+
+def issue_token() -> str:
+    """แจก token ให้หนึ่ง session — เรียกตอนเสิร์ฟหน้าเว็บเท่านั้น
+
+    ตั้ง WEB_AUTH_TOKEN ไว้ = คืนค่านั้นทุกครั้ง (ไม่หมุน ดู `fixed_token`)
+    """
+    fixed = fixed_token()
+    if fixed:
+        return fixed
+    token = secrets.token_urlsafe(32)
+    now = time.monotonic()
+    with _live_lock:
+        _prune_tokens(now)
+        while _live and len(_live) >= TOKEN_MAX:   # `_live and` — TOKEN_MAX=0 ไม่วนค้าง
+            # เต็มเพดาน: เตะตัวที่จะหมดอายุก่อนออกไป (= ตัวที่ไม่ได้ถูกใช้นานสุด
+            # เพราะทุกครั้งที่ยืนยันผ่าน อายุถูกต่อใหม่) ยิง GET / รัว ๆ ครบเพดาน
+            # ยังเตะแท็บที่เปิดค้างอยู่ได้ แต่คนที่เรียก / ได้ก็ได้ token ที่ใช้งาน
+            # ได้อยู่แล้ว จึงไม่ได้สิทธิ์เพิ่ม — ผลเสียคือแท็บนั้นต้องโหลดหน้าใหม่
+            del _live[min(_live, key=_live.get)]     # type: ignore[arg-type]
+        _live[token] = now + token_ttl()
+    return token
 
 
 def token_ok(token: str | None) -> bool:
@@ -130,8 +173,28 @@ def token_ok(token: str | None) -> bool:
         return False
     # เทียบเป็น bytes เสมอ — compare_digest ของ str รับเฉพาะ ASCII
     # (client ส่ง token ภาษาไทยเข้ามาต้องได้ False ไม่ใช่ 500)
-    return secrets.compare_digest(str(token).encode("utf-8"),
-                                  session_token().encode("utf-8"))
+    raw = str(token).encode("utf-8")
+    fixed = fixed_token()
+    if fixed and secrets.compare_digest(raw, fixed.encode("utf-8")):
+        return True
+    now = time.monotonic()
+    ttl = token_ttl()
+    with _live_lock:
+        _prune_tokens(now)
+        for live in list(_live):
+            if secrets.compare_digest(raw, live.encode("utf-8")):
+                # ต่ออายุทุกครั้งที่ใช้งานได้จริง (sliding) — เซสชันที่ยังคุยอยู่จึง
+                # ไม่หมดอายุกลางทาง ส่วนแท็บที่ถูกปิดทิ้งไว้จะหลุดไปเองตาม TTL
+                _live[live] = now + ttl
+                return True
+    return False
+
+
+def live_token_count() -> int:
+    """จำนวน token ที่ยังใช้ได้ — ไว้ยืนยันใน test ว่าหมุนจริงและถูกกวาดจริง"""
+    with _live_lock:
+        _prune_tokens(time.monotonic())
+        return len(_live)
 
 
 def allowed_origins() -> list[str]:
@@ -217,11 +280,23 @@ WEB_RANGES: dict[str, tuple[int, int]] = {
     "WEB_RATE_LIMIT": (0, 100_000),
     "WEB_SELFTEST_LIMIT": (0, 100_000),
     "WEB_MAX_SESSIONS": (0, 10_000),
+    # อย่างน้อย 1 นาที (สั้นกว่านั้นหน้าเว็บที่เพิ่งโหลดก็ต่อ /ws ไม่ทัน)
+    # อย่างมาก 7 วัน — ไม่ใช่ 0 = ไม่หมดอายุ เพราะจุดประสงค์ของการหมุนคือให้มันหมดอายุ
+    "WEB_TOKEN_TTL_S": (60, 604_800),
 }
 
 
 def rate_window() -> int:
     return env_int("WEB_RATE_WINDOW_S", 60, *WEB_RANGES["WEB_RATE_WINDOW_S"])
+
+
+def token_ttl() -> int:
+    """อายุ token ที่หมุน — นับจากครั้งล่าสุดที่ใช้งานได้ ไม่ใช่จากตอนแจก
+
+    ค่าปริยาย 12 ชั่วโมง: ยาวพอครอบการใช้งานต่อเนื่องทั้งวันโดยไม่ต้องโหลดหน้าใหม่
+    (การต่อ /ws และการเรียก /api/* นับเป็นการใช้งาน จึงต่ออายุให้เอง)
+    """
+    return env_int("WEB_TOKEN_TTL_S", 43_200, *WEB_RANGES["WEB_TOKEN_TTL_S"])
 
 
 def api_rate_limit() -> int:
@@ -357,14 +432,19 @@ async def index(request: Request) -> HTMLResponse:
 
     meta tag ใช้กับ /api/* (header X-Session-Token) ส่วน cookie ใช้กับ /ws
     (H-01 — WebSocket ตั้ง header เองไม่ได้ แต่ cookie ถูกแนบให้อัตโนมัติ)
+
+    token หมุนใหม่ทุกครั้งที่โหลดหน้า — ต้องแจกครั้งเดียวแล้วใช้ค่าเดียวกันทั้ง meta
+    และ cookie (เรียก issue_token() สองรอบ = ได้สองค่า แล้ว /ws กับ /api/* จะถือ
+    token คนละตัว ซึ่งใช้ได้ทั้งคู่แต่เปลืองโควตาใน store ไปเปล่า ๆ ทุกการโหลดหน้า)
     """
+    token = issue_token()
     html = (STATIC / "index.html").read_text(encoding="utf-8")
-    html = html.replace(TOKEN_PLACEHOLDER, escape(session_token(), quote=True))
+    html = html.replace(TOKEN_PLACEHOLDER, escape(token, quote=True))
     resp = HTMLResponse(html, headers={"Cache-Control": "no-store"})
     resp.set_cookie(
         # ค่า cookie ต้อง encode เป็น latin-1 ได้ WEB_AUTH_TOKEN ที่เป็นภาษาไทย
         # ทำให้ set_cookie โยน UnicodeEncodeError แล้วหน้าเว็บกลายเป็น 500 ทั้งหน้า
-        WS_TOKEN_COOKIE, quote(session_token(), safe=""),
+        WS_TOKEN_COOKIE, quote(token, safe=""),
         httponly=True,          # JS อ่านไม่ได้ ลด surface ตอนมี XSS
         samesite="strict",      # เว็บอื่นเรียก /ws จะไม่ได้ cookie ไปด้วย (กัน CSWSH)
         secure=request_is_https(request),
@@ -579,7 +659,12 @@ def main() -> int:
     if warn:
         print(warn + "\n")
     uvicorn.run("web.server:app", host=args.host, port=args.port,
-                reload=args.reload, log_level="warning")
+                reload=args.reload, log_level="warning",
+                # ไม่ประกาศ "Server: uvicorn" ให้ผู้ที่กำลังสำรวจช่องโหว่อ่านฟรี ๆ
+                # ต้องปิดที่ชั้น uvicorn: มันเอา default header ไปต่อกับ header ที่แอป
+                # ส่ง ไม่ใช่แทนที่ ฉะนั้นถ้าไปตั้ง Server เองใน middleware จะได้ header
+                # ซ้ำสองอันแทนที่จะทับกัน (SECURITY_HEADERS จึงช่วยเรื่องนี้ไม่ได้)
+                server_header=False)
     return 0
 
 
