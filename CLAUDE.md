@@ -203,11 +203,48 @@ marking it in the source.
 `/ws` and `/api/*` are not open. `web/server.py` checks the `Origin` header against an allowlist
 **before** `ws.accept()` (rejecting after accept still gives an attacker a live socket), and also
 requires a session token. The token is generated per process (`WEB_AUTH_TOKEN` overrides it, which
-you need when running multiple workers), substituted into `index.html` when it is served, and sent
-back by the client as `?token=` on the WebSocket and the `X-Session-Token` header on `/api/*`.
-A request with no `Origin` header at all (curl, a native client) is not automatically trusted — it
-still has to present a valid token. The `ready` payload deliberately carries no `log_dir` and no
-`base_url`, only an `api_configured` boolean, because every client that connects can read it.
+you need when running multiple workers) and reaches the client two ways when `index.html` is
+served: substituted into a `<meta>` tag (the browser sends it back as `X-Session-Token` on
+`/api/*`) and set as an `HttpOnly; SameSite=Strict` cookie (the browser sends it automatically on
+the `/ws` handshake). A request with no `Origin` header at all (curl, a native client) is not
+automatically trusted — it still has to present a valid token, and for those `?token=` on the
+WebSocket URL still works as a fallback. The `ready` payload deliberately carries no `log_dir` and
+no `base_url`, only an `api_configured` boolean, because every client that connects can read it.
+
+The token deliberately does **not** travel in the WebSocket URL for browsers: query strings land in
+proxy/CDN access logs and `Referer`. Two dead ends are worth not repeating — both are recorded in
+comments at `WS_TOKEN_COOKIE`:
+
+- `Sec-WebSocket-Protocol` cannot carry it. Subprotocol values must be RFC 7230 tokens, so a
+  `WEB_AUTH_TOKEN` containing Thai text or `"<>` makes `new WebSocket()` throw `SyntaxError`
+  outright; and RFC 6455 §4.1 makes the browser fail the handshake unless the server echoes a
+  subprotocol back, so any proxy that drops the header breaks the whole app.
+- cookie values must be latin-1 encodable, so the token is percent-encoded on the way out and
+  `unquote`d on the way in. Setting it raw makes `set_cookie` raise and turns `GET /` into a 500.
+
+Anything operator-configurable may be non-ASCII — `token_ok` compares bytes for the same reason.
+
+Security headers come from one `SECURITY_HEADERS` dict applied by an HTTP middleware, so every
+response carries them (`X-Frame-Options`, `nosniff`, `Referrer-Policy`, `Permissions-Policy`, HSTS,
+COOP, CSP). `script-src` is `'self'` with **no** `'unsafe-inline'`/`'unsafe-eval'`; that is why the
+theme bootstrap lives in `web/static/theme-init.js` instead of an inline `<script>` (it must stay a
+plain `<script src>` with no `defer`, or the theme flashes on every load). `style-src` still needs
+`'unsafe-inline'` because the markup uses `style=` attributes. `openapi_url=None` keeps the API
+schema off the public surface. `tests/test_frontend_ui.py` serves the same headers so a CSP that
+breaks the real page fails there — it relaxes `'unsafe-eval'` only because Playwright's
+`wait_for_function` evaluates a string in the page; production must never have it.
+
+Rate limits (`web/server.py`, all optional) guard the expensive paths: `WEB_RATE_LIMIT` per
+`WEB_RATE_WINDOW_S` for `/api/config` and opening `/ws`, a separate stricter `WEB_SELFTEST_LIMIT`
+for `/api/selftest` (which runs a full TTS→ASR→LLM round trip and costs real credits), and
+`WEB_MAX_SESSIONS` for concurrently open sessions. `0` disables a limit. Buckets are keyed per
+client; behind a reverse proxy every request appears to come from the proxy, so
+`WEB_TRUST_PROXY=1` switches the key to the first `X-Forwarded-For` hop — only safe when actually
+behind a proxy, since otherwise anyone can forge the header. The session slot is released as the
+**first** statement of the `/ws` `finally`, before the remaining awaits, so a stalled teardown
+cannot leak a slot permanently. Note that Starlette's `TestClient` stops driving the endpoint once
+the websocket context exits, so its `finally` never completes there — the release invariant is
+tested against a real uvicorn server (`live_server` in `tests/test_web_auth.py`), not `TestClient`.
 
 ### Config
 
@@ -226,6 +263,10 @@ concerns that are easy to conflate when tuning:
 - tool-calling limits — `SEARCH_*`, `FETCH_MAX_CHARS`, `FETCH_MAX_BYTES`, `TOOL_ROUNDS`,
   `KEEP_FINDINGS`
 - web security — `WEB_ALLOWED_ORIGINS`, `WEB_AUTH_TOKEN`
+- web rate limits — `WEB_RATE_LIMIT`, `WEB_RATE_WINDOW_S`, `WEB_SELFTEST_LIMIT`,
+  `WEB_MAX_SESSIONS`, `WEB_TRUST_PROXY` (these live in `web/server.py`, not the `Config`
+  dataclass, because `vc/` must not know about the web mode; their ranges are declared in
+  `WEB_RANGES` there and `tests/test_config_validation.py` reads that dict)
 - logging and time — `LOG_DIR`, `LOG_TRANSCRIPT`, `LOG_RETENTION_DAYS`, `APP_TZ`
 
 ### Time

@@ -173,11 +173,14 @@ def test_bare_defaults_produce_no_warnings(clean_env) -> None:
 
 def test_every_numeric_key_in_env_example_has_a_range() -> None:
     """กันเพิ่ม key ใหม่แล้วลืมประกาศช่วง"""
+    from web.server import WEB_RANGES      # key ฝั่งเว็บประกาศช่วงไว้ที่ web/server.py
+
     numeric = {k: v for k, v in env_example().items()
                if re.fullmatch(r"-?\d+(\.\d+)?", v)}
     skip = {"LOG_TRANSCRIPT", "ECHO_GUARD", "TTS_SINGLE_REQUEST",
-            "TTS_SEARCH_FILLER", "WEB_SEARCH"}          # ค่าเปิด/ปิด
-    missing = sorted(k for k in numeric if k not in RANGES and k not in skip)
+            "TTS_SEARCH_FILLER", "WEB_SEARCH", "WEB_TRUST_PROXY"}   # ค่าเปิด/ปิด
+    declared = set(RANGES) | set(WEB_RANGES)
+    missing = sorted(k for k in numeric if k not in declared and k not in skip)
     assert missing == [], f"key ตัวเลขที่ยังไม่มีช่วง: {missing}"
 
 

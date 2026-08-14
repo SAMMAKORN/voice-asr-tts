@@ -7,11 +7,14 @@ const $ = (id) => document.getElementById(id);
 const TOUR_KEY = 'voicelink.tour.v1';
 const THEME_KEY = 'voicelink.theme.v1';
 
-/* token ที่เซิร์ฟเวอร์ฝังมากับหน้าเว็บ (P1-1) — ต้องแนบไปทุกคำขอ
-   ทั้ง WebSocket (?token=) และ /api/* (header X-Session-Token)
+/* token ที่เซิร์ฟเวอร์ฝังมากับหน้าเว็บ (P1-1) — แนบไปกับ /api/* ทาง header
+   X-Session-Token   ส่วน /ws ไม่ต้องแนบเอง: เซิร์ฟเวอร์ตั้ง cookie HttpOnly
+   ไว้ตอนเสิร์ฟหน้าเว็บ เบราว์เซอร์จึงส่งให้อัตโนมัติตอน handshake (H-01)
+   — เลิกใส่ ?token= ใน URL แล้ว เพราะ query string ติดไปกับ log ของ proxy/CDN
    เว็บอื่นอ่านค่านี้ไม่ได้เพราะติด Same-Origin Policy ของ fetch/XHR */
 const TOKEN = (document.querySelector('meta[name="session-token"]') || {}).content || '';
 const authHeaders = () => (TOKEN ? { 'X-Session-Token': TOKEN } : {});
+
 
 let CFG = { mic_sr: 16000, speaker_sr: 24000, frame_ms: 20 };
 
@@ -544,7 +547,8 @@ function connect() {
   // ส่งเสียงที่เลือก/จำไว้ไปตั้งแต่ตอนต่อ WebSocket กัน session ทักทายด้วยเสียง
   // ของ .env ไปก่อนแล้วค่อยสลับทีหลัง (พูดผิดเพศไปแล้วประโยคแรก)
   const voice = encodeURIComponent($('sel-voice').value || '');
-  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}&voice=${voice}`);
+  // token เดินทางมากับ cookie ไม่ใช่ query string (H-01) — voice ไม่ลับ อยู่ใน URL ได้
+  ws = new WebSocket(`${proto}://${location.host}/ws?voice=${voice}`);
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {

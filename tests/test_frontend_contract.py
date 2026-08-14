@@ -94,8 +94,10 @@ def test_auto_reconnect_uses_capped_backoff() -> None:
     assert values == sorted(values) and values[-1] <= 15000, values
     assert len(values) >= 4
     assert "R.tries >= RETRY_DELAYS.length" in JS, "ต้องมีเพดานจำนวนครั้ง"
-    assert "token=" in JS[JS.index("function connect()"):][:400], (
-        "reconnect ต้องแนบ token ทุกครั้ง (P1-1)")
+    # H-01: token เดินทางมากับ cookie ที่เซิร์ฟเวอร์ตั้งไว้ ไม่ใช่ query string
+    assert "token=" not in JS[JS.index("function connect()"):][:800], (
+        "token ต้องไม่อยู่ใน URL ของ WebSocket — รั่วเข้า log ของ proxy/CDN (H-01)")
+    assert "/ws?token=" not in JS
 
 
 def test_new_session_marks_that_memory_restarted() -> None:

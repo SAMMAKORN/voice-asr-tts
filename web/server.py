@@ -11,12 +11,15 @@ import os
 import secrets
 import sys
 import threading
+import time
 import traceback
+from collections.abc import Callable
 from html import escape
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (Depends, FastAPI, Header, HTTPException, Request, WebSocket,
+                     WebSocketDisconnect)
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -31,8 +34,41 @@ STATIC = HERE / "static"
 
 log = logging.getLogger("voicechat.web")
 
-app = FastAPI(title="Voice Link", docs_url=None, redoc_url=None)
+app = FastAPI(title="Voice Link", docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+# ─────────────────────────────────────────────── security headers (H-02)
+# แอปนี้ไม่ตั้ง header ความปลอดภัยเลยมาก่อน ถูก embed ใน iframe/clickjack ได้
+# และไม่มี CSP กันสคริปต์ภายนอก ตั้ง header กลางที่นี่ครั้งเดียวใช้กับทุก response
+# HTTP (WebSocket handshake ไม่ผ่าน http middleware จึงไม่โดนแตะ)
+SECURITY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "microphone=(self), camera=(), geolocation=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    # HSTS มีผลเฉพาะเมื่อโหลดผ่าน https — บน http (localhost dev) เบราว์เซอร์เมิน
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    # CSP: script-src เป็น 'self' ล้วน — สคริปต์ที่ถูกฝังเข้ามาจึงรันไม่ได้เลย
+    # (theme bootstrap ย้ายไป /static/theme-init.js แล้วเพื่อการนี้)
+    # style-src ยังต้องมี 'unsafe-inline' เพราะ index.html ใช้ style="..." อยู่หลายจุด
+    # ซึ่งอันตรายน้อยกว่ากันมากเมื่อ script ถูกล็อกไว้แล้ว จะรัดต่อก็ต้องรื้อ markup
+    # connect-src 'self' ครอบ ws:// ที่ origin เดียวกันด้วย (ยืนยันกับ Chromium แล้ว)
+    "Content-Security-Policy": (
+        "default-src 'self'; img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self'; "
+        "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; "
+        "form-action 'self'; object-src 'none'"
+    ),
+}
+
+
+@app.middleware("http")
+async def add_security_headers(request, call_next):
+    resp = await call_next(request)
+    for key, value in SECURITY_HEADERS.items():
+        resp.headers.setdefault(key, value)
+    return resp
 
 # ─────────────────────────────────────────────── สิทธิ์เข้าใช้งาน (P1-1: CSWSH)
 # WebSocket ไม่อยู่ใต้ Same-Origin Policy เว็บใดก็ได้ที่ผู้ใช้เปิดค้างไว้จึงต่อเข้า
@@ -41,11 +77,42 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 TOKEN_PLACEHOLDER = "__SESSION_TOKEN__"
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+# H-01: token เดินทางมากับ cookie ไม่ใช่ ?token= เพราะค่าใน query string ติดไป
+# กับ access log ของ proxy/CDN (เช่น Cloudflare) และ Referer ส่วน cookie ไม่รั่ว
+#
+# เคยลองใส่ไว้ใน Sec-WebSocket-Protocol แล้วไม่เวิร์ค เก็บไว้เป็นบันทึกกันหลงทางซ้ำ:
+#   1) ค่า subprotocol ต้องเป็น "token" ตาม RFC 7230 — WEB_AUTH_TOKEN ที่เป็น
+#      ภาษาไทยหรือมี " < > ทำให้ new WebSocket() โยน SyntaxError ทิ้งทันที
+#   2) RFC 6455 §4.1 บังคับว่าถ้า client เสนอ subprotocol มา เซิร์ฟเวอร์ต้องตอบ
+#      กลับมาด้วย ไม่ตอบ = เบราว์เซอร์ล้ม handshake ("no response was received")
+#      ทำให้ทุก proxy/เซิร์ฟเวอร์ที่ไม่ echo header นี้ทำหน้าเว็บพังหมด
+# cookie ไม่มีข้อจำกัดทั้งสองข้อ และ SameSite=Strict ยังกัน CSWSH เพิ่มอีกชั้น
+# นอกเหนือจากการตรวจ Origin (เว็บอื่นเรียก /ws จะไม่ได้ cookie ติดไปด้วยเลย)
+WS_TOKEN_COOKIE = "vl_session_token"
+
+
+def request_is_https(request) -> bool:
+    """ตั้งแฟล็ก Secure ให้ cookie เฉพาะเมื่อมาทาง https จริง
+
+    ตั้ง Secure บน http (เช่น localhost ตอน dev) เบราว์เซอร์จะทิ้ง cookie ทันที
+    แล้วต่อ WebSocket ไม่ได้ — ต้องดู X-Forwarded-Proto ด้วยเพราะหลัง Cloudflare
+    /reverse proxy scheme ที่เห็นตรงนี้เป็น http แม้ผู้ใช้เข้ามาทาง https
+    """
+    if request.url.scheme == "https":
+        return True
+    fwd = request.headers.get("x-forwarded-proto", "")
+    return fwd.split(",")[0].strip().lower() == "https"
+
+
 _token_lock = threading.Lock()
 _token: str | None = None
 
 # ตัวนับไว้ยืนยันใน test/log ว่า connection ที่ถูกปฏิเสธไม่ได้สร้าง WebSession จริง
-STATS = {"sessions_created": 0, "rejected": 0}
+STATS = {"sessions_created": 0, "rejected": 0, "rate_limited": 0}
+
+# จำนวน session ที่กำลังทำงานอยู่ — แต่ละตัวกิน 1 เธรด + เปิดสิทธิ์เรียก API ทั้งชุด
+_active_lock = threading.Lock()
+_active = 0
 
 
 def session_token() -> str:
@@ -103,10 +170,141 @@ def ws_authorized(origin: str | None, token: str | None, port: int | None = None
     return origin_allowed(origin, port) and token_ok(token)
 
 
+def ws_client_token(ws: WebSocket) -> str | None:
+    """token จาก handshake — อ่าน cookie ก่อน (ไม่รั่วเข้า log/Referer)
+    ถ้าไม่มีค่อยตกไปอ่าน ?token= ให้ client แบบ native (curl/สคริปต์เทสต์)
+    """
+    raw = ws.cookies.get(WS_TOKEN_COOKIE)
+    if raw:
+        return unquote(raw)      # ตั้งค่าไว้เป็น percent-encoded เสมอ (ดู index())
+    return ws.query_params.get("token")
+
+
 def require_token(x_session_token: str | None = Header(default=None)) -> None:
     """สิทธิ์เข้าถึง /api/* — หน้าเว็บแนบ header นี้ให้อัตโนมัติ"""
     if not token_ok(x_session_token):
         raise HTTPException(status_code=401, detail="ต้องมี session token ที่ถูกต้อง")
+
+
+# ─────────────────────────────────────────────── จำกัดอัตราการเรียก (M-02)
+# /api/selftest ยิงครบวง TTS→ASR→LLM ทุกครั้ง (ราว 5-6 วินาทีและมีค่า API จริง)
+# ใครถือ token อยู่ก็ยิงรัว ๆ ได้ไม่จำกัด = เผา GPU/เครดิตขององค์กรฟรี ๆ
+# ทำเป็น sliding window ในตัว ไม่เพิ่ม dependency ให้โปรเจกต์
+def env_int(name: str, default: int, low: int, high: int) -> int:
+    """อ่านค่าจำนวนเต็มจาก env แบบเดียวกับ vc/config.py — ผิดชนิดล้มทันที เกินช่วงถูกหั่น"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} ต้องเป็นจำนวนเต็ม (ได้ {raw!r}) "
+                         f"ช่วงที่รับคือ {low}–{high}")
+    if not (low <= value <= high):
+        clamped = max(low, min(high, value))
+        log.warning("%s=%s อยู่นอกช่วง %d–%d — ใช้ %d แทน",
+                    name, value, low, high, clamped)
+        return clamped
+    return value
+
+
+# ช่วงที่รับได้ของ key ตัวเลขฝั่งเว็บ — ประกาศเป็น dict เพื่อให้ทั้งโค้ดและเทสต์
+# (tests/test_config_validation.py) อ่านจากที่เดียวกัน ไม่ต้องไล่แก้สองที่
+# key เหล่านี้อยู่ที่นี่ไม่ใช่ vc/config.py เพราะเป็นเรื่องของเว็บล้วน ๆ และ vc/
+# ต้องไม่รู้จักโหมดเว็บ (เหมือน WEB_ALLOWED_ORIGINS / WEB_AUTH_TOKEN)
+WEB_RANGES: dict[str, tuple[int, int]] = {
+    "WEB_RATE_WINDOW_S": (1, 3600),
+    "WEB_RATE_LIMIT": (0, 100_000),
+    "WEB_SELFTEST_LIMIT": (0, 100_000),
+    "WEB_MAX_SESSIONS": (0, 10_000),
+}
+
+
+def rate_window() -> int:
+    return env_int("WEB_RATE_WINDOW_S", 60, *WEB_RANGES["WEB_RATE_WINDOW_S"])
+
+
+def api_rate_limit() -> int:
+    return env_int("WEB_RATE_LIMIT", 60, *WEB_RANGES["WEB_RATE_LIMIT"])
+
+
+def selftest_rate_limit() -> int:
+    return env_int("WEB_SELFTEST_LIMIT", 5, *WEB_RANGES["WEB_SELFTEST_LIMIT"])
+
+
+def max_sessions() -> int:
+    return env_int("WEB_MAX_SESSIONS", 8, *WEB_RANGES["WEB_MAX_SESSIONS"])
+
+
+def trust_proxy() -> bool:
+    return (os.environ.get("WEB_TRUST_PROXY") or "").strip() in ("1", "true", "yes")
+
+
+def client_key(conn) -> str:
+    """ตัวระบุผู้เรียกสำหรับนับโควตา
+
+    หลัง Cloudflare/reverse proxy ทุกคำขอมาจาก IP ของ proxy ตัวเดียว ถ้านับตามนั้น
+    โควตาจะกลายเป็นของรวมทุกคนแล้วผู้ใช้จริงโดนบล็อกกันเอง — ตั้ง WEB_TRUST_PROXY=1
+    เพื่อให้เชื่อ X-Forwarded-For (เชื่อได้เฉพาะเมื่ออยู่หลัง proxy จริง ไม่งั้น
+    ใครก็ปลอม header นี้เพื่อรีเซ็ตโควตาตัวเองได้)
+    """
+    if trust_proxy():
+        first = (conn.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        if first:
+            return first
+    return conn.client.host if conn.client else "?"
+
+
+class RateLimiter:
+    """sliding window ต่อ (ชนิดคำขอ, ผู้เรียก) — ใช้ monotonic กันเวลาระบบถูกปรับ"""
+
+    PRUNE_EVERY = 256        # กวาด key ที่ไม่มีใครใช้ทิ้ง กัน dict โตไม่จำกัด
+
+    def __init__(self) -> None:
+        self._hits: dict[tuple[str, str], list[float]] = {}
+        self._lock = threading.Lock()
+        self._calls = 0
+
+    def check(self, kind: str, who: str, limit: int, window: int) -> float:
+        """ผ่าน → 0.0 ; ไม่ผ่าน → จำนวนวินาทีที่ควรรอก่อนลองใหม่"""
+        if limit <= 0:
+            return 0.0          # 0 = ปิดการจำกัด
+        now = time.monotonic()
+        with self._lock:
+            self._calls += 1
+            if self._calls % self.PRUNE_EVERY == 0:
+                self._prune(now, window)
+            hits = self._hits.setdefault((kind, who), [])
+            hits[:] = [t for t in hits if t > now - window]
+            if len(hits) >= limit:
+                return max(0.01, hits[0] + window - now)
+            hits.append(now)
+            return 0.0
+
+    def _prune(self, now: float, window: int) -> None:
+        for key in [k for k, v in self._hits.items() if not v or v[-1] <= now - window]:
+            del self._hits[key]
+
+    def reset(self) -> None:
+        with self._lock:
+            self._hits.clear()
+            self._calls = 0
+
+
+LIMITER = RateLimiter()
+
+
+def rate_limited(kind: str, limit: Callable[[], int]):
+    """สร้าง dependency สำหรับ /api/* — เกินโควตาได้ 429 พร้อม Retry-After"""
+    def dep(request: Request) -> None:
+        wait = LIMITER.check(kind, client_key(request), limit(), rate_window())
+        if wait:
+            STATS["rate_limited"] += 1
+            raise HTTPException(
+                status_code=429,
+                detail=f"เรียกถี่เกินไป ลองใหม่ในอีก {int(wait) + 1} วินาที",
+                headers={"Retry-After": str(int(wait) + 1)})
+    return dep
 
 
 def startup_warning(host: str) -> str | None:
@@ -154,14 +352,29 @@ def voice_options(cfg: Config) -> list[dict]:
 
 
 @app.get("/")
-async def index() -> HTMLResponse:
-    """ฝัง session token ลงหน้าเว็บตอนเสิร์ฟ — client แนบกลับมาทุกคำขอ"""
+async def index(request: Request) -> HTMLResponse:
+    """ฝัง session token ลงหน้าเว็บตอนเสิร์ฟ — client แนบกลับมาทุกคำขอ
+
+    meta tag ใช้กับ /api/* (header X-Session-Token) ส่วน cookie ใช้กับ /ws
+    (H-01 — WebSocket ตั้ง header เองไม่ได้ แต่ cookie ถูกแนบให้อัตโนมัติ)
+    """
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     html = html.replace(TOKEN_PLACEHOLDER, escape(session_token(), quote=True))
-    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+    resp = HTMLResponse(html, headers={"Cache-Control": "no-store"})
+    resp.set_cookie(
+        # ค่า cookie ต้อง encode เป็น latin-1 ได้ WEB_AUTH_TOKEN ที่เป็นภาษาไทย
+        # ทำให้ set_cookie โยน UnicodeEncodeError แล้วหน้าเว็บกลายเป็น 500 ทั้งหน้า
+        WS_TOKEN_COOKIE, quote(session_token(), safe=""),
+        httponly=True,          # JS อ่านไม่ได้ ลด surface ตอนมี XSS
+        samesite="strict",      # เว็บอื่นเรียก /ws จะไม่ได้ cookie ไปด้วย (กัน CSWSH)
+        secure=request_is_https(request),
+        path="/",
+    )
+    return resp
 
 
-@app.get("/api/config", dependencies=[Depends(require_token)])
+@app.get("/api/config", dependencies=[Depends(require_token),
+                                      Depends(rate_limited("config", api_rate_limit))])
 async def api_config() -> JSONResponse:
     cfg = session_config()
     return JSONResponse({
@@ -179,7 +392,9 @@ async def api_config() -> JSONResponse:
     })
 
 
-@app.post("/api/selftest", dependencies=[Depends(require_token)])
+@app.post("/api/selftest",
+          dependencies=[Depends(require_token),
+                        Depends(rate_limited("selftest", selftest_rate_limit))])
 async def api_selftest(voice: str = "") -> JSONResponse:
     cfg = session_config()
     if voice:
@@ -214,6 +429,18 @@ def _thread_stack(thread: threading.Thread) -> str:
     return "".join(traceback.format_stack(frames))
 
 
+def release_session_slot() -> None:
+    """คืนโควตา session ที่จองไว้ — เรียกได้ทุกทางออกของ /ws (ห้ามติดลบ)"""
+    global _active
+    with _active_lock:
+        _active = max(0, _active - 1)
+
+
+def active_sessions() -> int:
+    with _active_lock:
+        return _active
+
+
 async def close_session(session, worker: threading.Thread) -> None:
     """ปิด session ให้จบจริง — ถ้า join ไม่สำเร็จต้องดังและต้องไม่ทิ้งทรัพยากรค้าง"""
     session.request_stop()
@@ -232,7 +459,7 @@ async def ws_endpoint(ws: WebSocket, voice: str = "") -> None:
     # ตรวจสิทธิ์ "ก่อน" accept เสมอ — ถ้า accept ไปแล้วค่อยปิด ผู้โจมตีจะได้
     # connection ที่เปิดจริงชั่วขณะและอาจได้ข้อความแรกไปด้วย
     origin = ws.headers.get("origin")
-    token = ws.query_params.get("token")
+    token = ws_client_token(ws)
     if not ws_authorized(origin, token, ws.url.port):
         STATS["rejected"] += 1
         log.warning("ปฏิเสธการเชื่อมต่อ WebSocket: origin=%r token=%s",
@@ -240,7 +467,30 @@ async def ws_endpoint(ws: WebSocket, voice: str = "") -> None:
         await ws.close(code=1008)
         return
 
-    await ws.accept()
+    # M-02: กันเปิด session รัว ๆ ทั้งแบบถี่และแบบค้างไว้เยอะ ๆ พร้อมกัน
+    # ต้องเช็คก่อน accept เหมือนชั้นตรวจสิทธิ์ ไม่ให้ได้ socket ที่เปิดจริงมาก่อน
+    wait = LIMITER.check("ws", client_key(ws), api_rate_limit(), rate_window())
+    if wait:
+        STATS["rate_limited"] += 1
+        log.warning("ปฏิเสธ WebSocket: เปิด session ถี่เกินไปจาก %s", client_key(ws))
+        await ws.close(code=1013)      # 1013 = Try Again Later
+        return
+
+    cap = max_sessions()
+    with _active_lock:
+        global _active
+        if cap and _active >= cap:
+            STATS["rate_limited"] += 1
+            log.warning("ปฏิเสธ WebSocket: session ที่เปิดอยู่ครบ %d แล้ว", cap)
+            await ws.close(code=1013)
+            return
+        _active += 1
+
+    try:
+        await ws.accept()
+    except Exception:
+        release_session_slot()
+        raise
     loop = asyncio.get_running_loop()
     out = Outbox(loop)
 
@@ -249,6 +499,7 @@ async def ws_endpoint(ws: WebSocket, voice: str = "") -> None:
     except SystemExit as exc:
         await ws.send_json({"type": "log", "level": "error", "text": str(exc)})
         await ws.close()
+        release_session_slot()
         return
 
     if voice:
@@ -296,6 +547,9 @@ async def ws_endpoint(ws: WebSocket, voice: str = "") -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("ws error: %r", exc)
     finally:
+        # คืนโควตาก่อน await ที่เหลือ — ถ้าไปวางท้ายสุดแล้วมี await ตัวใดค้าง
+        # (เคยเจอ pump ค้างใต้ TestClient) โควตาจะรั่วถาวรทีละหนึ่งต่อการปิดแท็บ
+        release_session_slot()
         await close_session(session, worker)
         out.close()
         await pump
