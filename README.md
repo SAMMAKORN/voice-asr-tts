@@ -93,6 +93,7 @@ python3 -m web.server
 | Session token   | เซิร์ฟเวอร์สุ่ม token **ใหม่ทุกครั้งที่โหลดหน้าเว็บ** (หนึ่งแท็บหนึ่งใบ) ฝังลงหน้าเว็บตอนเสิร์ฟ · `/ws` ใช้ cookie `HttpOnly` ที่ตั้งให้อัตโนมัติ ส่วน `/api/*` ใช้ header `X-Session-Token` · ไม่มี/ผิด/หมดอายุ = `401` หรือปิด WebSocket ด้วย `1008` |
 | อายุ token      | หมดอายุตาม `WEB_TOKEN_TTL_S` (ปริยาย 12 ชม.) นับจากครั้งล่าสุดที่ใช้งาน — เซสชันที่ยังคุยอยู่จึงไม่หลุดกลางทาง ใบที่รั่วออกไปหมดอายุเอง ไม่ได้อยู่ถึงรีสตาร์ตเซิร์ฟเวอร์                                                                               |
 | ข้อมูลที่ส่งออก | event `ready` และ `/api/config` ไม่ส่ง path บันทึกในเครื่องและไม่ส่ง `API_BASE_URL` ออกไปให้เบราว์เซอร์อีกต่อไป · ไม่ประกาศ header `Server: uvicorn`                                                                                                   |
+| โควตาการเรียก   | `WEB_RATE_LIMIT` ครั้งต่อ `WEB_RATE_WINDOW_S` วินาที สำหรับ `/api/config` และการเปิด `/ws` ต่อผู้เรียกหนึ่งราย · `/api/selftest` มีเพดานแยกที่แน่นกว่า (`WEB_SELFTEST_LIMIT`) เพราะยิงครบวง TTS→ASR→LLM ทุกครั้ง · `WEB_MAX_SESSIONS` จำกัดจำนวน session ที่เปิดพร้อมกันได้ · ตั้งค่าใดเป็น `0` = ปิดเพดานนั้น |
 
 - ค่าเริ่มต้นอนุญาตเฉพาะ `http://127.0.0.1:<พอร์ต>` และ `http://localhost:<พอร์ต>`
   เปิดจากโดเมนอื่นให้ตั้ง `WEB_ALLOWED_ORIGINS=https://voice.example.com` (คั่นหลายค่าด้วยจุลภาค)
@@ -101,6 +102,9 @@ python3 -m web.server
   ถ้าต้องเปิดจริงให้ตั้ง `WEB_AUTH_TOKEN` และ `WEB_ALLOWED_ORIGINS` เองใน `.env`
 - การตั้ง `WEB_AUTH_TOKEN` เองจะ**ปิดการหมุน token** (ใช้ค่าที่ตั้งไว้ตลอด) ซึ่งจำเป็นเมื่อรันหลาย
   worker เพราะ token ที่หมุนเก็บอยู่ในหน่วยความจำของ process เดียว worker อื่นยืนยันไม่ผ่าน
+- อยู่หลัง reverse proxy จริง (Cloudflare ฯลฯ) ให้ตั้ง `WEB_TRUST_PROXY=1` เพื่อนับโควตาแยกตาม
+  IP ผู้ใช้จริงจาก `X-Forwarded-For` — ตั้งได้เฉพาะเมื่ออยู่หลัง proxy จริงเท่านั้น ไม่งั้นใครก็
+  ปลอม header นี้รีเซ็ตโควตาตัวเองได้
 
 ### Deploy บน Coolify จาก Private Repository
 
@@ -178,14 +182,45 @@ AI จะตอบกลับเป็นเสียงพร้อม caption
 
 ## 4. การทดสอบระบบ
 
+ชุดเทสต์หลักรันด้วย **pytest** (`pytest.ini` ที่รากโปรเจกต์) ค่าเริ่มต้น
+`-m "not network and not browser"` จึงไม่เปิดการเชื่อมต่ออินเทอร์เน็ตและไม่เปิดเบราว์เซอร์เลย
+— รันได้ปลอดภัยหลังแก้โค้ดทุกครั้ง
+
 ```bash
-python3 voice_chat.py --selftest     # ทดสอบ TTS → ASR → LLM ครบวงจร
-python3 tests/test_offline.py        # ตรรกะ VAD / การพูดแทรก / การตัดประโยค (ไม่ต่อเน็ต)
-python3 tests/test_web.py            # ทดสอบสะพานฝั่งเว็บ WebMic/WebSpeaker/WebConsole
-python3 tests/test_search.py         # ทดสอบการค้นเน็ตและ tool calling
-python3 tests/test_web_e2e.py        # ทดสอบเซิร์ฟเวอร์จริงผ่าน WebSocket ครบวงจร
-python3 tests/test_browser.py        # ทดสอบผ่านเบราว์เซอร์จริงด้วย Playwright
+pytest                              # ชุดเริ่มต้น ~233 เทสต์ ไม่ต่อเน็ต ไม่ใช้ไมค์ ~13 วินาที
+pytest -m unit                      # เซตเดียวกัน ระบุ marker ชัดเจน
+pytest -m browser                   # 21 เทสต์ Playwright กับหน้าเว็บจริง (ต้องมี chromium)
+pytest tests/test_layering.py -v    # รันไฟล์เดียว
 ```
+
+ติดตั้ง Playwright เฉพาะเมื่อจะรัน `-m browser` (ไม่อยู่ใน `requirements.txt`):
+
+```bash
+pip install playwright && python3 -m playwright install chromium
+```
+
+ไฟล์เทสต์เก่า 5 ไฟล์เขียนก่อนย้ายมาใช้ pytest และมี harness `check()` ของตัวเอง
+`tests/conftest.py` ใส่ไว้ใน `collect_ignore` ให้ pytest ข้ามไป จึงต้องรันตรงด้วยมือ —
+การลบ/เปลี่ยนชื่อฟังก์ชันใน `vc/` จะไม่ขึ้นเป็นเทสต์แดงจนกว่าจะรันไฟล์พวกนี้เอง:
+
+```bash
+python3 voice_chat.py --selftest         # ทดสอบ TTS → ASR → LLM ครบวงจร
+python3 tests/test_offline.py            # VAD / การพูดแทรก / การตัดประโยค — ไม่ต่อเน็ต
+python3 tests/test_web.py                # สะพานฝั่งเว็บ WebMic/WebSpeaker/WebConsole — ไม่ต่อเน็ต
+python3 tests/test_search.py --offline   # ตรวจ URL/host และ SSRF guard เท่านั้น — ไม่ต่อเน็ต
+python3 tests/test_search.py             # เพิ่มการค้นเน็ต + tool calling จริง (ต้องมี .env)
+python3 tests/test_web_e2e.py            # เซสชันเว็บเต็มรูปแบบผ่าน WebSocket จริง (ต้องมี .env)
+python3 tests/test_browser.py            # เปิดเบราว์เซอร์จริงด้วย Playwright (ต้องมี .env + chromium)
+```
+
+`test_offline.py` และ `test_web.py` ไม่ต่อเน็ตจึงรันได้ทุกเมื่อ ส่วน `test_web_e2e.py`
+กับ `test_browser.py` ยิงไปที่ ASR/LLM/TTS จริงตาม `.env` และมีค่าใช้จ่าย API จริง —
+อย่ารันพร่ำเพรื่อเพียงเพื่อเช็คว่าโค้ดพัง
+
+CI (`.github/workflows/tests.yml`) รันเฉพาะ `pytest -q` แล้วตามด้วยสามไฟล์ offline
+(`test_offline.py` / `test_web.py` / `test_search.py --offline`) ไม่ต้องมี `.env` หรือ
+เครดิตใด ๆ ส่วน `-m browser`, `-m network`, `test_web_e2e.py`, `test_browser.py`
+ตั้งใจไม่ใส่ใน CI เพราะต้องมี credential จริง
 
 `tests/test_browser.py` เปิด Chromium จริงผ่าน Playwright โดยใช้ไมโครโฟนจำลอง
 ที่ป้อนเสียงจากไฟล์ WAV เพื่อทดสอบเส้นทางเสียงทั้งหมดโดยไม่ต้องมีผู้พูดจริง
@@ -289,6 +324,7 @@ chmod 600 .env        # กันผู้ใช้อื่นบนเคร�
 ```
 voice_chat.py           ตัวเรียกฝั่งบรรทัดคำสั่ง: อ่าน argument → ประกอบค่าตั้ง → สั่ง vc/
 vc/chat.py              ตัวควบคุมหลัก: วนรับเหตุการณ์ จัดคิว TTS จัดการการพูดแทรก
+vc/phase.py             TurnPhase (IDLE/TRANSCRIBING/GENERATING/SPEAKING) และกติกาพูดแทรกต่อช่วง
 vc/options.py           RuntimeOptions — สัญญาของตัวเลือกตอนรันที่แกนกลางเป็นเจ้าของ
 vc/config.py            โหลดค่าคอนฟิกจาก .env พร้อมตรวจช่วงค่าและเขตเวลา
 vc/api.py               เรียก LiteLLM: chat แบบสตรีม, ASR, TTS, แปลง WAV/PCM
@@ -308,6 +344,7 @@ web/session.py          หนึ่ง WebSocket ต่อหนึ่ง sessi
 web/bridge.py           WebMic / WebSpeaker / WebConsole ทำหน้าที่แทนไมค์ ลำโพง และจอ
 web/static/index.html   โครงหน้าเว็บและคู่มือแนะนำการใช้งาน
 web/static/style.css    ธีมของหน้าเว็บ
+web/static/theme-init.js  บูตธีม dark/light ก่อน render (สคริปต์แยกไฟล์ เพราะ CSP ไม่มี unsafe-inline)
 web/static/app.js       จับเสียงไมค์ เล่นเสียง วาด caption/มิเตอร์ ควบคุมคู่มือ
 web/static/mic-worklet.js  แปลงเสียงไมค์เป็นเฟรม 16 kHz / 20 ms ใน audio thread
 ```
@@ -482,6 +519,7 @@ AudioWorklet → PCM 16 kHz/20ms → WebSocket (binary) → VoiceGate (VAD ต�
 ```
 CHAT_MODEL / ASR_MODEL / TTS_MODEL   ชื่อโมเดลที่ใช้งาน
 CHAT_TEMPERATURE / CHAT_MAX_TOKENS   พฤติกรรมของ LLM
+LANG_HINT                            ภาษาหลักที่ใบ้ให้ ASR (th, en, ja, …)
 SYSTEM_PROMPT                        กำหนดบุคลิกของ AI (ค่าเริ่มต้นตอบไทย สั้น ไม่มี Markdown)
 REPLY_MAX_SENTENCES                  เพดานจำนวนประโยคต่อคำตอบ (0 = ปิดเพดานนี้)
 REPLY_MAX_CHARS                      เพดานตัวอักษรต่อคำตอบ (ตั้งสูงมาก = ปิดเพดานนี้)
@@ -501,17 +539,28 @@ VAD_ABS_THRESHOLD                    เกณฑ์ความไวในก�
 VAD_NOISE_MULT                       ตัวคูณเหนือระดับเสียงรบกวนรอบข้าง
 VAD_CONFIRM_MS(_PLAYBACK)            ระยะเวลาที่ต้องพูดต่อเนื่องก่อนเริ่มอัด/ก่อนขัด AI
 VAD_END_SILENCE_MS                   ระยะเวลาเงียบที่ถือว่าพูดจบ
+VAD_MIN_UTTERANCE_MS / _MAX_         ความยาวคำพูดต่ำสุด/สูงสุดที่ยอมรับ (มิลลิวินาที)
 ECHO_GUARD / ECHO_MARGIN             การป้องกันเสียงสะท้อนจากลำโพงเข้าไมค์
 BARGE_IN_MIN_CHARS                   ความยาวข้อความขั้นต่ำที่นับเป็นการพูดแทรกจริง
 WEB_SEARCH                           เปิด/ปิดการค้นข้อมูลจากอินเทอร์เน็ต
 SEARCH_RESULTS                       จำนวนผลค้นหาที่ส่งให้โมเดล
 SEARCH_TIMEOUT                       ระยะเวลาสูงสุดที่รอผลค้นหา (วินาที)
 FETCH_MAX_CHARS                      ความยาวเนื้อหาหน้าเว็บสูงสุดที่ส่งให้โมเดล
+FETCH_MAX_BYTES                      เพดานไบต์ที่ยอมดาวน์โหลดต่อหนึ่งหน้าเว็บ
 TOOL_ROUNDS                          จำนวนรอบสูงสุดที่เรียกเครื่องมือได้ต่อหนึ่งคำถาม
 APP_TZ                               เขตเวลาที่ใช้ทั้งระบบ (ไม่ตั้ง = Asia/Bangkok)
 LOG_DIR                              ที่เก็บบันทึกการสนทนา (ไม่ตั้ง = ./logs)
 LOG_TRANSCRIPT                       1 = เก็บคำพูด / 0 = เก็บแค่ตัวเลข latency
 LOG_RETENTION_DAYS                   ลบ session ที่เก่ากว่า N วัน (0 = ไม่ลบ)
+
+# ความปลอดภัย/โควตาของโหมดเว็บ (web/server.py — ดูรายละเอียดในหัวข้อ 2)
+WEB_ALLOWED_ORIGINS                  origin ที่ยอมให้ต่อ WebSocket/เรียก /api (ค่าเริ่มต้น = เฉพาะ 127.0.0.1/localhost)
+WEB_AUTH_TOKEN                       ตั้งเองเพื่อปิดการหมุน token (จำเป็นเมื่อรันหลาย worker)
+WEB_TOKEN_TTL_S                      อายุ token ที่หมุน นับจากครั้งล่าสุดที่ใช้งาน (ค่าเริ่มต้น 12 ชม.)
+WEB_RATE_LIMIT / WEB_RATE_WINDOW_S   โควตาคำขอต่อผู้เรียกหนึ่งราย สำหรับ /api/config และการเปิด /ws
+WEB_SELFTEST_LIMIT                   โควตาแยกที่แน่นกว่าสำหรับ /api/selftest (ยิงครบวงจริง มีค่าใช้จ่าย)
+WEB_MAX_SESSIONS                     จำนวน session ที่เปิดพร้อมกันได้สูงสุด
+WEB_TRUST_PROXY                      1 = นับโควตาตาม X-Forwarded-For (ตั้งได้เฉพาะหลัง proxy จริง)
 ```
 
 **การตรวจค่าตอนเริ่มโปรแกรม**
