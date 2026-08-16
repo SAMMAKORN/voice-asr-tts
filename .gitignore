@@ -7,3 +7,6 @@ __pycache__/
 
 # ไฟล์เสียงที่เทสสร้างขึ้น
 tests/_fakemic/
+
+# worktree ชั่วคราวที่ Claude Code agent สร้างเวลารันงานแบบ isolated
+.claude/worktrees/
