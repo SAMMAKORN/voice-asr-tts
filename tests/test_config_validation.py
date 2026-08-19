@@ -178,8 +178,8 @@ def test_every_numeric_key_in_env_example_has_a_range() -> None:
     numeric = {k: v for k, v in env_example().items()
                if re.fullmatch(r"-?\d+(\.\d+)?", v)}
     skip = {"LOG_TRANSCRIPT", "ECHO_GUARD", "TTS_SINGLE_REQUEST",
-            "TTS_SEARCH_FILLER", "TTS_READ_NUMBERS", "WEB_SEARCH",
-            "WEB_TRUST_PROXY"}                                      # ค่าเปิด/ปิด
+            "TTS_SEARCH_FILLER", "TTS_READ_NUMBERS", "TTS_REF_NORMALIZE",
+            "WEB_SEARCH", "WEB_TRUST_PROXY"}                        # ค่าเปิด/ปิด
     declared = set(RANGES) | set(WEB_RANGES)
     missing = sorted(k for k in numeric if k not in declared and k not in skip)
     assert missing == [], f"key ตัวเลขที่ยังไม่มีช่วง: {missing}"
@@ -206,6 +206,7 @@ def test_defaults_in_code_sit_inside_their_own_ranges() -> None:
         "TTS_MAX_CHARS": cfg.tts_max_chars, "TTS_FIRST_CHARS": cfg.tts_first_chars,
         "TTS_CHUNK_CHARS": cfg.tts_chunk_chars,
         "TTS_CHUNK_GROWTH": cfg.tts_chunk_growth,
+        "TTS_REF_MAX_SEC": cfg.tts_ref_max_sec,
         "SEARCH_RESULTS": cfg.search_results, "SEARCH_TIMEOUT": cfg.search_timeout,
         "FETCH_MAX_CHARS": cfg.fetch_max_chars,
         "FETCH_MAX_BYTES": cfg.fetch_max_bytes, "TOOL_ROUNDS": cfg.tool_rounds,
