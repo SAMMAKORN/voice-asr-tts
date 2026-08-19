@@ -252,3 +252,15 @@ def test_voice_gender_follows_reference(cfg):
     assert cfg.voice_gender == "female"
     cfg.tts_ref_audio = ""          # ไม่โคลน = เสียงสุ่ม ไม่มีเพศแน่นอน
     assert cfg.voice_gender == "male"
+
+
+# --- หน้าเว็บ ------------------------------------------------------------------
+def test_web_dropdown_shows_the_cloned_voice(cfg):
+    """dropdown กับ chip บนหัวเว็บต้องมาจากแหล่งเดียวกัน ไม่งั้นโชว์คนละอย่าง"""
+    from web.server import voice_options
+
+    label = voice_options(cfg)[0]["label"]
+    assert cfg.tts_label in label
+
+    cfg.tts_ref_audio = ""          # ปิดโคลน = กลับไปโชว์แค่ชื่อโมเดล
+    assert voice_options(cfg)[0]["label"].endswith(cfg.tts_model)

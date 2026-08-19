@@ -417,7 +417,9 @@ def voice_options(cfg: Config) -> list[dict]:
     """
     items: list[dict] = []
     if cfg.tts_model:
-        items.append({"value": "api", "label": f"เซิร์ฟเวอร์ · {cfg.tts_model}"})
+        # ใช้ cfg.tts_label ไม่ใช่ cfg.tts_model ตรง ๆ — ประกอบชื่อเองตรงนี้ทำให้
+        # dropdown ไม่รู้เรื่องการโคลนเสียง แล้วโชว์คนละอย่างกับ chip บนหัวเว็บ
+        items.append({"value": "api", "label": f"เซิร์ฟเวอร์ · {cfg.tts_label}"})
     names = [name for name, _label, _gender in THAI_VOICES]
     if cfg.edge_voice and cfg.edge_voice not in names:
         names.append(cfg.edge_voice)     # เสียงที่ตั้งเองใน .env ต้องเลือกกลับมาได้
