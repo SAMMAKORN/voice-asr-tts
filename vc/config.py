@@ -60,6 +60,7 @@ RANGES: dict[str, tuple[float, float, str]] = {
     "TTS_FIRST_CHARS": (4, 2_000, "ขนาดก้อนแรก"),
     "TTS_CHUNK_CHARS": (8, 2_000, "ขนาดก้อนที่สอง"),
     "TTS_CHUNK_GROWTH": (1.0, 5.0, "อัตราโตของก้อนถัดไป"),
+    "TTS_REF_MAX_SEC": (0.0, 30.0, "วินาทีของเสียงอ้างอิงที่ส่งไปโคลน"),
     "SEARCH_RESULTS": (1, 20, "จำนวนผลค้นที่ส่งให้โมเดล"),
     "SEARCH_TIMEOUT": (1.0, 120.0, "วินาทีที่ยอมรอผลค้นทั้งกระบวนการ"),
     "FETCH_MAX_CHARS": (200, 200_000, "ตัวอักษรจากหน้าเว็บที่ส่งให้โมเดล"),
@@ -258,6 +259,15 @@ class Config:
     # (มีผลกับเสียงเท่านั้น หน้าจอ/ประวัติสนทนายังเป็นตัวเลขปกติ — ดู vc/thainum.py)
     tts_read_numbers: bool = True
 
+    # --- โคลนเสียง (เฉพาะแบ็กเอนด์ api / k2-fsa/OmniVoice) ---
+    # ไม่ส่งเสียงอ้างอิง = OmniVoice สุ่มเสียงคนพูดใหม่ทุก request คำตอบเดียวที่ถูก
+    # หั่นหลายก้อนจึงเปลี่ยนคนกลางประโยค · ส่งอ้างอิง = เสียงเดียวกันทั้งบท (ดู vc/voiceclone.py)
+    tts_ref_audio: str = "sound/thai_default.wav"
+    tts_ref_text: str = ""            # ว่าง = อ่านจากไฟล์ .txt ข้าง ๆ แล้วค่อยถอดเสียงเอง
+    tts_ref_max_sec: float = 0.0      # 0 = ส่งทั้งไฟล์ (ref_text ตรงกับเสียงครบ)
+    tts_ref_normalize: bool = True    # ปรับความดังไฟล์อ้างอิงก่อนส่ง — ไฟล์เบาทำให้ AI พูดเบา
+    tts_ref_gender: str = "female"    # เพศของเสียงอ้างอิง — ตัดสินคำลงท้าย ครับ/ค่ะ
+
     # --- แบ็กเอนด์เสียงพูด: "api" = TTS_MODEL บนเซิร์ฟเวอร์ · "edge" = Microsoft Edge ---
     tts_backend: str = "api"
     edge_voice: str = "th-TH-PremwadeeNeural"
@@ -311,19 +321,30 @@ class Config:
             from .tts_edge import voice_label   # import ตรงนี้กัน import วนกลับมาที่ config
 
             return f"Edge · {voice_label(self.edge_voice)}"
+        if self.clone_enabled:
+            from pathlib import Path
+
+            return f"{self.tts_model} · {Path(self.tts_ref_audio).stem}"
         return self.tts_model
+
+    @property
+    def clone_enabled(self) -> bool:
+        """โคลนเสียงได้เฉพาะแบ็กเอนด์ api และต่อเมื่อระบุไฟล์อ้างอิงไว้"""
+        return not self.use_edge_tts and bool(self.tts_ref_audio)
 
     @property
     def voice_gender(self) -> str:
         """เพศของเสียงที่กำลังใช้พูด — ตัดสินคำลงท้าย (ครับ/ค่ะ) ในคำตอบของโมเดล
 
-        แบ็กเอนด์ api มีเสียงเดียวตายตัว (TTS_MODEL) ไม่มีตัวเลือกเพศจึงถือเป็นชายเสมอ
+        แบ็กเอนด์ api ไม่มีตัวเลือกเสียงในตัว เพศจึงมาจากไฟล์เสียงอ้างอิงที่โคลนอยู่
+        (TTS_REF_GENDER) และตกกลับไปเป็นชายเมื่อไม่ได้โคลน เพราะเสียงสุ่มของ
+        OmniVoice ไม่มีเพศแน่นอนอยู่แล้ว
         """
         if self.use_edge_tts:
             from .tts_edge import voice_gender as _voice_gender
 
             return _voice_gender(self.edge_voice)
-        return "male"
+        return self.tts_ref_gender if self.clone_enabled else "male"
 
     @property
     def tts_voice_value(self) -> str:
@@ -426,6 +447,22 @@ def check_combinations(cfg: Config) -> list[str]:
     return out
 
 
+def _ref_audio() -> str:
+    """ว่าง/0/off = ปิดการโคลน กลับไปใช้เสียงสุ่มของ OmniVoice"""
+    raw = os.environ.get("TTS_REF_AUDIO")
+    if raw is None:
+        return "sound/thai_default.wav"
+    raw = raw.strip()
+    return "" if raw.lower() in ("", "0", "off", "none") else raw
+
+
+def _ref_gender() -> str:
+    g = (os.environ.get("TTS_REF_GENDER") or "female").strip().lower()
+    if g not in ("male", "female"):
+        raise SystemExit(f"TTS_REF_GENDER ต้องเป็น male หรือ female เท่านั้น (ได้ '{g}')")
+    return g
+
+
 def load_config() -> Config:
     load_dotenv(ROOT / ".env")
 
@@ -474,6 +511,11 @@ def load_config() -> Config:
         tts_chunk_growth=_f("TTS_CHUNK_GROWTH", 1.8, w),
         tts_search_filler=_b("TTS_SEARCH_FILLER", True, w),
         tts_read_numbers=_b("TTS_READ_NUMBERS", True, w),
+        tts_ref_audio=_ref_audio(),
+        tts_ref_text=(os.environ.get("TTS_REF_TEXT") or "").strip(),
+        tts_ref_max_sec=_f("TTS_REF_MAX_SEC", 0.0, w),
+        tts_ref_normalize=_b("TTS_REF_NORMALIZE", True, w),
+        tts_ref_gender=_ref_gender(),
         tts_backend=backend,
         edge_voice=os.environ.get("EDGE_TTS_VOICE") or "th-TH-PremwadeeNeural",
         edge_rate=os.environ.get("EDGE_TTS_RATE") or "+0%",

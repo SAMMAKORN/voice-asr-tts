@@ -102,6 +102,18 @@ def resample_i16(pcm: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
 class ApiClient:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        # สร้างไว้ตั้งแต่ต้นแม้ยังไม่โคลน (ตัวมันอ่านไฟล์แบบ lazy) — สร้างทีหลัง
+        # ในเธรด TTS จะซ้อนกันได้เมื่อสองก้อนแรกออกพร้อมกัน
+        self._voice_ref = None
+        if cfg.clone_enabled:
+            from .voiceclone import VoiceReference
+
+            self._voice_ref = VoiceReference(
+                cfg.tts_ref_audio,
+                text=cfg.tts_ref_text,
+                max_sec=cfg.tts_ref_max_sec,
+                normalize=cfg.tts_ref_normalize,
+            )
         headers = {
             "Authorization": f"Bearer {cfg.api_key}",
             "Accept": "application/json",
@@ -342,8 +354,22 @@ class ApiClient:
             raise ApiError(f"asr ตอบกลับผิดรูปแบบ: {r.text[:200]}") from None
 
     # ------------------------------------------------------------------- tts
+    def _reference_payload(self) -> dict | None:
+        """เสียงอ้างอิงสำหรับโคลน โหลดครั้งเดียวแล้วจำไว้ (None = ไม่โคลน)
+
+        ส่ง `transcribe` เข้าไปด้วยเพื่อให้ถอดคำอ่านเองได้เมื่อผู้ใช้เอาไฟล์เสียง
+        ตัวเองมาวางโดยไม่มี .txt คู่กัน — เรียกครั้งเดียวตอนก้อนแรกเท่านั้น
+        """
+        if not self.cfg.clone_enabled or self._voice_ref is None:
+            return None
+        return self._voice_ref.payload(self.transcribe)
+
     def synthesize(self, text: str, dst_sr: int) -> np.ndarray:
-        """OmniVoice ผ่าน LiteLLM รับได้แค่ {model, input} — ใส่ voice/format แล้ว 500
+        """OmniVoice ผ่าน LiteLLM รับ {model, input} + คู่ {ref_audio, ref_text}
+
+        `voice`/`speed`/`response_format` ยังใส่ไม่ได้เหมือนเดิม (500 หรือถูกเมิน)
+        แต่ **โคลนเสียงได้** เมื่อส่ง ref_audio เป็น data URI พร้อม ref_text ที่ตรงกัน
+        ซึ่งทำให้เสียงคงที่ทุกก้อนแทนที่จะสุ่มใหม่ทุก request — ดู vc/voiceclone.py
 
         ถ้าตั้ง TTS_BACKEND=edge จะไปเรียก Microsoft Edge แทน (เลือกเสียงได้
         และเสียงคงที่ทุกก้อน) — import ตรงนี้เพื่อไม่ให้ import วนกันกับ tts_edge
@@ -360,6 +386,9 @@ class ApiClient:
             )
 
         payload = {"model": self.cfg.tts_model, "input": text}
+        ref = self._reference_payload()
+        if ref:
+            payload.update(ref)
         r = self._post(self._audio, "/v1/audio/speech", "tts", json=payload)
         body = r.content
         if body[:4] != b"RIFF":

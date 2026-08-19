@@ -119,6 +119,17 @@ web/           FastAPI app; WebSession(vc.chat.VoiceChat) + browser-side audio a
   `ReplyLimiter` (caps reply length in code, see below). `clean_for_tts` is the single
   funnel every chunk of speech passes through; `splits_number()` keeps chunk boundaries
   out of the middle of a number.
+- `voiceclone.py` — the reference clip OmniVoice clones its voice from. Without it the
+  model picks a *new random speaker on every request*, so one reply split into several TTS
+  chunks changes voice mid-sentence (MFCC similarity between chunks: 0.77 without, 0.92 with).
+  The server accepts exactly one shape — `ref_audio` as a **data URI** together with
+  `ref_text`, the transcript of that clip. Raw base64, dicts and lists all 500, and
+  `reference_audio`/`prompt_audio` are silently dropped by LiteLLM and return a cheerful 200
+  with an uncloned voice — so HTTP status alone proves nothing here, you have to listen or
+  measure. The trap that costs the most time: `ref_audio` **without** `ref_text` also returns
+  200, but the audio is near-silence that ASR reads back as gibberish. Loudness is cloned too,
+  so the clip is peak-normalised before sending — a quiet reference makes the whole system
+  whisper. A broken reference disables cloning and logs once; it must never stop speech.
 - `thainum.py` — reads digits out as Thai words before synthesis (`25` → `ยี่สิบห้า`),
   because `k2-fsa/OmniVoice` cannot pronounce arabic numerals. TTS-only: the chat view,
   the history sent back to the model and `transcript.md` all keep the digits.
@@ -293,6 +304,9 @@ concerns that are easy to conflate when tuning:
   (sensitive; usually don't need touching unless the mic or room changes)
 - reply shape — `CHAT_MAX_TOKENS`, `REPLY_MAX_SENTENCES`, `REPLY_MAX_CHARS`
 - speech rendering — `TTS_READ_NUMBERS` (digits → Thai words, `vc/thainum.py`)
+- voice cloning — `TTS_REF_AUDIO`, `TTS_REF_TEXT`, `TTS_REF_GENDER`, `TTS_REF_MAX_SEC`,
+  `TTS_REF_NORMALIZE` (`vc/voiceclone.py`; `TTS_REF_GENDER` also drives `voice_gender`,
+  which decides whether the model answers with `ครับ` or `ค่ะ`)
 - network resilience — `HTTP_RETRY_MAX`, `HTTP_RETRY_BASE_MS`
 - tool-calling limits — `SEARCH_*`, `FETCH_MAX_CHARS`, `FETCH_MAX_BYTES`, `TOOL_ROUNDS`,
   `KEEP_FINDINGS`
