@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import re
 
+from .thainum import speak_numbers
+
 STRONG = ".!?…。！？\n:;"
 SOFT = " \t,)]”\"'ๆ"
 # ขอบ "ประโยค" จริง ๆ (แคบกว่า STRONG: ไม่นับ : กับ ; ที่มักอยู่กลางประโยค)
@@ -18,12 +20,53 @@ SENTENCE_END = ".!?…。！？\n"
 _MD = re.compile(r"(\*\*|__|\*|`{1,3}|^#{1,6}\s+|^\s*[-•*]\s+|^\s*>\s+)", re.MULTILINE)
 _LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _SPACES = re.compile(r"[ \t]{2,}")
+# ตัวคั่นที่อยู่กลางตัวเลขได้: จุดทศนิยม, คอมมาหลักพัน, เวลา 14:30
+NUM_SEP = ".,:"
 
 
-def clean_for_tts(text: str) -> str:
+def splits_number(buf: str, cut: int) -> bool:
+    """ตัด `buf` ที่ความยาว `cut` แล้วจะผ่ากลางตัวเลขไหม
+
+    ต้องกันเพราะตัวคั่นเหล่านี้อยู่ใน STRONG/SOFT ทั้งหมด ถ้าตัด "25.5" เป็น
+    "25." + "5" ตัวอ่านเลขไทย (vc/thainum.py) จะได้ "ยี่สิบห้า" แล้ว "ห้า"
+    แทนที่จะเป็น "ยี่สิบห้าจุดห้า"
+
+    ตัวคั่นที่อยู่ท้ายบัฟเฟอร์พอดี ("ราคา 25.") ยังไม่รู้ว่าเป็นทศนิยมหรือจบประโยค
+    จึงถือว่าใช่ไว้ก่อนแล้วรอตัวถัดไป — เหมือนที่ `ReplyLimiter._sentence_end` ทำ
+    """
+    if not 0 < cut <= len(buf):
+        return False
+    prev = buf[cut - 1]
+    nxt = buf[cut] if cut < len(buf) else ""
+    if prev in NUM_SEP:
+        return (cut >= 2 and buf[cut - 2].isdigit()
+                and (nxt.isdigit() or not nxt))
+    return prev.isdigit() and nxt.isdigit()
+
+
+def _last_cut(text: str, limit: int, chars: str) -> int:
+    """ดัชนีตัวคั่นท้ายสุดใน text[:limit] ที่ตัดได้จริง (-1 = ไม่มี)
+
+    ไล่จากท้ายมาหน้าและข้ามจุดที่จะผ่ากลางตัวเลข ต้องไม่ต่ำกว่าครึ่งของ limit
+    ไม่งั้นก้อนที่ได้จะสั้นเกินไป
+    """
+    for i in range(min(limit, len(text)) - 1, limit // 2 - 1, -1):
+        if text[i] in chars and not splits_number(text, i + 1):
+            return i
+    return -1
+
+
+def clean_for_tts(text: str, read_numbers: bool = True) -> str:
+    """เตรียมข้อความก้อนหนึ่งก่อนส่งเข้า TTS (ทางเดียวที่เสียงพูดผ่าน)
+
+    `read_numbers` แปลงตัวเลขเป็นตัวหนังสือไทยเพราะ OmniVoice อ่านตัวเลขไม่ออก
+    (ดู vc/thainum.py) — มีผลกับเสียงเท่านั้น หน้าจอยังเห็นเป็นตัวเลขปกติ
+    """
     text = _LINK.sub(r"\1", text)
     text = _MD.sub("", text)
     text = text.replace("—", " ").replace("–", " ").replace("|", " ")
+    if read_numbers:
+        text = speak_numbers(text)
     text = _SPACES.sub(" ", text)
     return text.strip()
 
@@ -43,12 +86,13 @@ def split_for_tts(text: str, limit: int) -> list[str]:
         return [text]
     out: list[str] = []
     while len(text) > limit:
-        window = text[:limit]
-        cut = max((window.rfind(c) for c in STRONG), default=-1)
-        if cut < limit // 2:
-            cut = window.rfind(" ")
-        if cut < limit // 2:
+        cut = _last_cut(text, limit, STRONG)
+        if cut < 0:
+            cut = _last_cut(text, limit, " ")
+        if cut < 0:
             cut = limit - 1
+            while cut > limit // 2 and splits_number(text, cut + 1):
+                cut -= 1
         piece, text = text[:cut + 1].strip(), text[cut + 1:].strip()
         if piece:
             out.append(piece)
@@ -252,9 +296,11 @@ class SentenceChunker:
 
         cut = -1
         min_len = min(12, limit)
+        # ทุกจุดตัดต้องผ่าน splits_number() ก่อน ไม่งั้น "25.5" จะถูกผ่าเป็น
+        # "25." + "5" แล้วอ่านออกเสียงเป็นสองจำนวน (ดู vc/thainum.py)
         # 1) เครื่องหมายวรรคตอนที่เจอก่อน = จุดตัดที่ดีที่สุด
         for i, ch in enumerate(buf):
-            if ch in STRONG and i + 1 >= min_len:
+            if ch in STRONG and i + 1 >= min_len and not splits_number(buf, i + 1):
                 cut = i + 1
                 break
         # 2) ไม่มีวรรคตอน (ปกติของภาษาไทย) → ตัดที่วรรคท้ายสุดที่ยังไม่เลยเพดานก้อน
@@ -262,18 +308,25 @@ class SentenceChunker:
             lo = max(min_len, limit // 3)
             hi = min(len(buf), int(limit * 1.6))
             for i in range(hi - 1, lo - 1, -1):
-                if buf[i] in SOFT:
+                if buf[i] in SOFT and not splits_number(buf, i + 1):
                     cut = i + 1
                     break
             if cut < 0:
                 # ไม่มีวรรคเลยในช่วงนั้น → ใช้วรรคแรกที่เจอถัดไป
                 for i in range(hi, len(buf)):
-                    if buf[i] in SOFT:
+                    if buf[i] in SOFT and not splits_number(buf, i + 1):
                         cut = i + 1
                         break
-        # 3) ยาวเกินเพดานจริง ๆ → ตัดตรง ๆ
+        # 3) ยาวเกินเพดานจริง ๆ → ตัดตรง ๆ (ถอยหลังพอให้ไม่ผ่ากลางตัวเลข)
         if cut < 0 and len(buf) >= self.hard_max:
             cut = self.hard_max
+            back = cut
+            while back > min_len and splits_number(buf, back):
+                back -= 1
+            # ถอยไม่พ้น (เช่นทั้งก้อนเป็นเลขล้วน) ก็ตัดที่เพดานตามเดิม
+            # ดีกว่าปล่อยก้อนสั้นจู๋หรือไม่ตัดเลยแล้วเสียงค้าง
+            if not splits_number(buf, back):
+                cut = back
         if cut < 0:
             return None
 

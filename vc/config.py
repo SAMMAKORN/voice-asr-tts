@@ -254,6 +254,9 @@ class Config:
     tts_chunk_chars: int = 60         # ขนาดก้อนที่สอง (ต้องสังเคราะห์ทันก่อนก้อนแรกเล่นจบ)
     tts_chunk_growth: float = 1.8     # ก้อนถัด ๆ ไปโตขึ้นเท่านี้ (ลดจำนวนครั้งที่เสียงเปลี่ยน)
     tts_search_filler: bool = True    # พูด "ขอค้นข้อมูลสักครู่" ระหว่างค้นเน็ตไหม
+    # แปลงตัวเลขเป็นตัวหนังสือไทยก่อนสังเคราะห์เสียง เพราะ OmniVoice อ่านตัวเลขไม่ออก
+    # (มีผลกับเสียงเท่านั้น หน้าจอ/ประวัติสนทนายังเป็นตัวเลขปกติ — ดู vc/thainum.py)
+    tts_read_numbers: bool = True
 
     # --- แบ็กเอนด์เสียงพูด: "api" = TTS_MODEL บนเซิร์ฟเวอร์ · "edge" = Microsoft Edge ---
     tts_backend: str = "api"
@@ -470,6 +473,7 @@ def load_config() -> Config:
         tts_chunk_chars=_i("TTS_CHUNK_CHARS", 60, w),
         tts_chunk_growth=_f("TTS_CHUNK_GROWTH", 1.8, w),
         tts_search_filler=_b("TTS_SEARCH_FILLER", True, w),
+        tts_read_numbers=_b("TTS_READ_NUMBERS", True, w),
         tts_backend=backend,
         edge_voice=os.environ.get("EDGE_TTS_VOICE") or "th-TH-PremwadeeNeural",
         edge_rate=os.environ.get("EDGE_TTS_RATE") or "+0%",
