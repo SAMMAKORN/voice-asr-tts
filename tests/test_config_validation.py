@@ -179,7 +179,8 @@ def test_every_numeric_key_in_env_example_has_a_range() -> None:
                if re.fullmatch(r"-?\d+(\.\d+)?", v)}
     skip = {"LOG_TRANSCRIPT", "ECHO_GUARD", "TTS_SINGLE_REQUEST",
             "TTS_SEARCH_FILLER", "TTS_READ_NUMBERS", "TTS_REF_NORMALIZE",
-            "WEB_SEARCH", "WEB_TRUST_PROXY"}                        # ค่าเปิด/ปิด
+            "ASR_SPELLCHECK", "TTS_SPELLCHECK", "GREET_FROM_LLM",
+            "WEB_SEARCH", "WEB_TRUST_PROXY"}                         # ค่าเปิด/ปิด
     declared = set(RANGES) | set(WEB_RANGES)
     missing = sorted(k for k in numeric if k not in declared and k not in skip)
     assert missing == [], f"key ตัวเลขที่ยังไม่มีช่วง: {missing}"
@@ -211,6 +212,7 @@ def test_defaults_in_code_sit_inside_their_own_ranges() -> None:
         "FETCH_MAX_CHARS": cfg.fetch_max_chars,
         "FETCH_MAX_BYTES": cfg.fetch_max_bytes, "TOOL_ROUNDS": cfg.tool_rounds,
         "LOG_RETENTION_DAYS": cfg.log_retention_days,
+        "SPELL_MIN_FREQ": cfg.spell_min_freq, "SPELL_MIN_LEN": cfg.spell_min_len,
     }
     assert set(pairs) == set(RANGES), "ตาราง RANGES กับค่าปริยายไม่ตรงกัน"
     for key, value in pairs.items():

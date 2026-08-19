@@ -128,6 +128,9 @@ def cfg(tmp_path):
         tts_model="fake-tts",
         log_dir=tmp_path / "logs",
         web_search=False,
+        # คำทักทายจาก LLM ต้องยิง API จริง — ชุดเทสต์ปริยายห้ามออกเน็ต (เหมือน
+        # web_search) เทสต์ที่ต้องการพฤติกรรมนี้เปิดเองด้วย dataclasses.replace
+        greet_from_llm=False,
     )
 
 

@@ -66,6 +66,8 @@ RANGES: dict[str, tuple[float, float, str]] = {
     "FETCH_MAX_CHARS": (200, 200_000, "ตัวอักษรจากหน้าเว็บที่ส่งให้โมเดล"),
     "FETCH_MAX_BYTES": (10_000, 50_000_000, "ไบต์ที่ยอมดาวน์โหลดต่อหน้า"),
     "TOOL_ROUNDS": (0, 10, "รอบการเรียกเครื่องมือต่อคำถาม"),
+    "SPELL_MIN_FREQ": (0, 10_000_000, "ความถี่ขั้นต่ำของคำที่ยอมแก้ไปหา"),
+    "SPELL_MIN_LEN": (2, 20, "ความยาวคำต่ำสุดที่ยอมแก้"),
     "LOG_RETENTION_DAYS": (0, 3_650, "ลบบันทึกที่เก่ากว่ากี่วัน (0 = ไม่ลบ)"),
 }
 
@@ -156,6 +158,19 @@ TRUE_WORDS = ("1", "true", "yes", "on")
 FALSE_WORDS = ("0", "false", "no", "off")
 
 
+def _words(key: str) -> tuple[str, ...]:
+    """อ่านรายการคำจาก .env — คั่นด้วยจุลภาคหรือวรรค อันไหนก็ได้
+
+    เก็บลำดับเดิมและตัดคำซ้ำออก เพื่อให้ค่าที่ได้เทียบกันตรง ๆ ในเทสต์ได้
+    """
+    raw = (os.environ.get(key) or "").replace(",", " ")
+    out: list[str] = []
+    for word in raw.split():
+        if word not in out:
+            out.append(word)
+    return tuple(out)
+
+
 def _b(key: str, default: bool, warnings: list[str] | None = None) -> bool:
     v = (os.environ.get(key) or "").strip().lower()
     if not v:
@@ -198,7 +213,7 @@ TOOL_INSTRUCTION = (
 )
 
 
-def _persona_instruction(gender: str) -> str:
+def persona_instruction(gender: str) -> str:
     """บอกโมเดลให้แทนตัวเอง/ลงท้ายประโยคให้ตรงเพศของเสียงพูดที่เลือกไว้
 
     ไม่งั้นโมเดลชอบเดาเป็น 'ผม...ครับ' โดยอัตโนมัติ ทำให้เสียงผู้หญิงพูดคำลงท้ายผิดเพศ
@@ -259,6 +274,20 @@ class Config:
     # (มีผลกับเสียงเท่านั้น หน้าจอ/ประวัติสนทนายังเป็นตัวเลขปกติ — ดู vc/thainum.py)
     tts_read_numbers: bool = True
 
+    # --- แก้คำผิดภาษาไทยจาก ASR ก่อนส่งให้โมเดล (vc/thaispell.py, ใช้ PyThaiNLP) ---
+    # ปิดอัตโนมัติถ้าเครื่องไม่ได้ติดตั้ง PyThaiNLP — ไม่ทำให้อะไรพัง
+    asr_spellcheck: bool = True
+    spell_min_freq: int = 1000   # คำที่จะแก้ไปหาต้องพบบ่อยอย่างน้อยเท่านี้ในคลังคำ
+    spell_min_len: int = 3       # คำสั้นกว่านี้ไม่แตะ (เศษจากตัวตัดคำ เดาผิดง่าย)
+    spell_keep_words: tuple[str, ...] = ()   # คำที่ห้ามแก้ (ชื่อเฉพาะ, ยี่ห้อ, ศัพท์ในบริษัท)
+    # แก้คำผิดของคำตอบโมเดลก่อนสังเคราะห์เสียงด้วย (มีผลกับเสียงเท่านั้น เหมือน
+    # TTS_READ_NUMBERS — ข้อความบนจอและประวัติสนทนายังเป็นคำที่โมเดลเขียนมาจริง)
+    tts_spellcheck: bool = True
+
+    # แต่งคำทักทายใหม่ด้วย LLM ทุกครั้งที่เริ่มระบบ (vc/greeting.py)
+    # ปิด/ยิงไม่สำเร็จ = ใช้รายการคำทักทายสำรองเหมือนเดิม
+    greet_from_llm: bool = True
+
     # --- โคลนเสียง (เฉพาะแบ็กเอนด์ api / k2-fsa/OmniVoice) ---
     # ไม่ส่งเสียงอ้างอิง = OmniVoice สุ่มเสียงคนพูดใหม่ทุก request คำตอบเดียวที่ถูก
     # หั่นหลายก้อนจึงเปลี่ยนคนกลางประโยค · ส่งอ้างอิง = เสียงเดียวกันทั้งบท (ดู vc/voiceclone.py)
@@ -305,6 +334,11 @@ class Config:
     @property
     def frame_samples(self) -> int:
         return int(self.mic_sr * self.frame_ms / 1000)
+
+    @property
+    def api_configured(self) -> bool:
+        """มีทั้ง base URL และ key ครบไหม — ไม่ครบคือทุกอย่างที่ต้องยิง API ใช้ไม่ได้"""
+        return bool(self.base_url and self.api_key)
 
     def now(self) -> datetime:
         """เวลาปัจจุบันตาม timezone ของคอนฟิกนี้ (มี tzinfo กำกับเสมอ)"""
@@ -393,7 +427,7 @@ class Config:
         parts = []
         if self.web_search:
             parts.append(TOOL_INSTRUCTION)
-        parts.append(_persona_instruction(self.voice_gender))
+        parts.append(persona_instruction(self.voice_gender))
         parts.append(stamp)
         parts.append(self.system_prompt)
         return {"role": "system", "content": "\n\n".join(parts)}
@@ -511,6 +545,12 @@ def load_config() -> Config:
         tts_chunk_growth=_f("TTS_CHUNK_GROWTH", 1.8, w),
         tts_search_filler=_b("TTS_SEARCH_FILLER", True, w),
         tts_read_numbers=_b("TTS_READ_NUMBERS", True, w),
+        asr_spellcheck=_b("ASR_SPELLCHECK", True, w),
+        spell_min_freq=_i("SPELL_MIN_FREQ", 1000, w),
+        spell_min_len=_i("SPELL_MIN_LEN", 3, w),
+        spell_keep_words=_words("SPELL_KEEP_WORDS"),
+        tts_spellcheck=_b("TTS_SPELLCHECK", True, w),
+        greet_from_llm=_b("GREET_FROM_LLM", True, w),
         tts_ref_audio=_ref_audio(),
         tts_ref_text=(os.environ.get("TTS_REF_TEXT") or "").strip(),
         tts_ref_max_sec=_f("TTS_REF_MAX_SEC", 0.0, w),

@@ -15,6 +15,10 @@ uvicorn[standard]>=0.29
 edge-tts>=7.0
 soundfile>=0.12
 
+# --- เฉพาะการแก้คำผิดภาษาไทยของผลถอดเสียง (ASR_SPELLCHECK=1) ---
+# import แบบ lazy ใน vc/thaispell.py — ไม่ติดตั้งก็รันได้ครบ แค่ไม่มีการแก้คำผิด
+pythainlp>=5.0
+
 # --- เฉพาะตอนทดสอบ (pytest tests/) ---
 pytest>=8.0
 

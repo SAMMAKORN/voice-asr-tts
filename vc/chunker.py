@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 
+from .thaiabbr import speak_abbreviations
 from .thainum import speak_numbers
 
 STRONG = ".!?…。！？\n:;"
@@ -17,11 +18,25 @@ SOFT = " \t,)]”\"'ๆ"
 # ขอบ "ประโยค" จริง ๆ (แคบกว่า STRONG: ไม่นับ : กับ ; ที่มักอยู่กลางประโยค)
 SENTENCE_END = ".!?…。！？\n"
 
-_MD = re.compile(r"(\*\*|__|\*|`{1,3}|^#{1,6}\s+|^\s*[-•*]\s+|^\s*>\s+)", re.MULTILINE)
+# `_` เดี่ยวก็เป็นตัวเน้นของ Markdown เหมือน `__` (เจอในบันทึกจริง: "และ_callisto_")
+_MD = re.compile(r"(\*\*|__|\*|_|`{1,3}|^#{1,6}\s+|^\s*[-•*]\s+|^\s*>\s+)",
+                 re.MULTILINE)
+# หัวข้อแบบมีลำดับ ("1. เรื่องวัน") — เก็บตัวเลขไว้ให้อ่านเป็น "หนึ่ง" แต่ตัดจุดทิ้ง
+# ไม่งั้นได้ "หนึ่ง." ที่มีจุดค้างให้ TTS อ่านไม่ออกและถูกนับเป็นจบประโยคด้วย
+_ORDERED = re.compile(r"^([ \t]*)([0-9]+)[.)]([ \t]+)", re.MULTILINE)
 _LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _SPACES = re.compile(r"[ \t]{2,}")
 # ตัวคั่นที่อยู่กลางตัวเลขได้: จุดทศนิยม, คอมมาหลักพัน, เวลา 14:30
 NUM_SEP = ".,:"
+# ช่วงพยัญชนะไทย ก-ฮ (ไม่รวมสระและวรรณยุกต์ที่อยู่ถัดไปในตาราง Unicode)
+THAI_CONSONANT_FIRST, THAI_CONSONANT_LAST = "\u0e01", "\u0e2e"
+ABBREV_MAX = 3      # พยัญชนะหน้าจุดของตัวย่อ ("ส." 1 · "กม." 2 · "ปตท." 3)
+# ตัวอักษรก่อนหน้าบัฟเฟอร์ที่ต้องเก็บไว้ให้ `abbrev_dot()` ดู — ทั้ง SentenceChunker
+# และ ReplyLimiter ปล่อยข้อความออกไปเรื่อย ๆ บัฟเฟอร์จึงเริ่มกลางคำได้ ถ้าไม่เก็บ
+# ท้ายของเดิมไว้ "…ครับ." ที่ถูกหั่นจนบัฟเฟอร์เหลือ "บ." จะดูเหมือนตัวย่อทันที
+ABBREV_CONTEXT = ABBREV_MAX + 1
+# ช่วงอักษรไทยทั้งหมด รวมสระและวรรณยุกต์ — ใช้ตรวจว่าหน้าตัวย่อเป็นขอบคำจริง
+THAI_FIRST, THAI_LAST = "\u0e01", "\u0e5b"
 
 
 def splits_number(buf: str, cut: int) -> bool:
@@ -44,6 +59,73 @@ def splits_number(buf: str, cut: int) -> bool:
     return prev.isdigit() and nxt.isdigit()
 
 
+def abbrev_dot(buf: str, i: int) -> bool:
+    """จุดที่ตำแหน่ง `i` เป็นจุดของตัวย่อไทย ไม่ใช่จุดจบประโยค ใช่ไหม
+
+    ตัวชี้ที่ใช้คือ **ตัวย่อไทยเป็นพยัญชนะล้วนและยืนเป็นคำของตัวเอง** — ส.ค., พ.ศ.,
+    ค.ศ., กม., ปตท. ไม่มีสระหรือวรรณยุกต์เลยสักตัว ส่วนคำที่ปิดท้ายประโยคจริง ๆ
+    ("ครับ.", "องศาครับ.", "แล้ว.") มีสระหรือวรรณยุกต์คั่นอยู่เสมอ จึงไล่ย้อนจากจุด
+    ไปตามพยัญชนะไทยล้วนได้ยาวสุด `ABBREV_MAX` ตัว **และต้องชนขอบคำพอดี** —
+    ข้อหลังนี่แหละที่แยก "ครับ." (ถอยได้แค่ "บ" แล้วชนสระ ั = ไม่ใช่ตัวย่อ) ออกจาก
+    "กม." (ถอยได้ "กม" แล้วชนวรรค = ตัวย่อ) ตัวย่อที่เขียนติดคำหน้ามา
+    ("บางจากและปตท.") จึงหลุดไป — ยอมพลาดฝั่งนั้นดีกว่าไปนับประโยคผิด
+
+    ไม่ใช้กติกาที่ง่ายกว่านี้ ("จุดหลังอักษรไทย = ตัวย่อเสมอ" ซึ่งจริงกับบันทึกจริง
+    ทั้ง 391 ข้อความ) เพราะเพดานจำนวนประโยคของ `ReplyLimiter` ต้องยังนับ
+    "หนึ่งครับ. สองครับ." ได้เมื่อโมเดลเขียนมาแบบนั้น
+
+    จุดหลังตัวเลขไม่เกี่ยวกับที่นี่ — `splits_number()` ดูแลอยู่แล้ว
+    ที่ต้องกันมีสองที่: `ReplyLimiter` เคยนับ "ส.ค." เป็นสองประโยคแล้วตัดคำตอบทิ้ง
+    ก่อนเวลาอันควร ส่วน `SentenceChunker` ผ่ากลางวันที่จนเสียงเปลี่ยนคนกลางคำ
+    """
+    if not (0 < i < len(buf)) or buf[i] != ".":
+        return False
+    letters = 0
+    j = i - 1
+    while j >= 0 and THAI_CONSONANT_FIRST <= buf[j] <= THAI_CONSONANT_LAST:
+        letters += 1
+        if letters > ABBREV_MAX:
+            return False
+        j -= 1
+    if not letters:
+        return False
+    return j < 0 or not THAI_FIRST <= buf[j] <= THAI_LAST
+
+
+def ordered_marker(buf: str, i: int, tail: str = "") -> bool:
+    """จุดที่ตำแหน่ง `i` เป็นจุดของหัวข้อมีลำดับ ("1." ต้นบรรทัด) ไม่ใช่จุดจบประโยค
+
+    โมเดลตอบเป็นรายการมีลำดับอยู่เรื่อย ๆ แม้ system prompt จะสั่งไม่ให้ใช้ Markdown
+    ถ้านับ "1." เป็นจบประโยคด้วย หนึ่งหัวข้อจะกินโควตาสองประโยค (อีกอันคือขึ้น
+    บรรทัดใหม่) แล้ว `REPLY_MAX_SENTENCES` จะตัดคำตอบทิ้งตั้งแต่หัวข้อที่สอง
+    """
+    buf, i = tail + buf, len(tail) + i
+    if not (0 < i < len(buf)) or buf[i] != ".":
+        return False
+    j = i - 1
+    while j >= 0 and buf[j].isdigit():
+        j -= 1
+    if j == i - 1:
+        return False                    # ไม่มีตัวเลขนำหน้าจุดเลย
+    while j >= 0 and buf[j] in " \t":
+        j -= 1
+    return j < 0 or buf[j] == "\n"      # ต้องอยู่ต้นบรรทัด ไม่ใช่กลางประโยค
+
+
+def splits_abbrev(buf: str, cut: int, tail: str = "") -> bool:
+    """ตัด `buf` ที่ความยาว `cut` แล้วจะผ่ากลางตัวย่อไหม
+
+    `tail` คือข้อความที่ถูกปล่อยออกไปก่อนหน้าบัฟเฟอร์นี้ (ดู `ABBREV_CONTEXT`)
+    """
+    return abbrev_dot(tail + buf, len(tail) + cut - 1)
+
+
+def unsafe_cut(buf: str, cut: int, tail: str = "") -> bool:
+    """จุดตัดที่ห้ามใช้ — ผ่ากลางตัวเลข กลางตัวย่อ หรือหลังเลขหัวข้อจนเหลือ "1." ลอย ๆ"""
+    return (splits_number(buf, cut) or splits_abbrev(buf, cut, tail)
+            or ordered_marker(buf, cut - 1, tail))
+
+
 def _last_cut(text: str, limit: int, chars: str) -> int:
     """ดัชนีตัวคั่นท้ายสุดใน text[:limit] ที่ตัดได้จริง (-1 = ไม่มี)
 
@@ -51,7 +133,7 @@ def _last_cut(text: str, limit: int, chars: str) -> int:
     ไม่งั้นก้อนที่ได้จะสั้นเกินไป
     """
     for i in range(min(limit, len(text)) - 1, limit // 2 - 1, -1):
-        if text[i] in chars and not splits_number(text, i + 1):
+        if text[i] in chars and not unsafe_cut(text, i + 1):
             return i
     return -1
 
@@ -60,11 +142,16 @@ def clean_for_tts(text: str, read_numbers: bool = True) -> str:
     """เตรียมข้อความก้อนหนึ่งก่อนส่งเข้า TTS (ทางเดียวที่เสียงพูดผ่าน)
 
     `read_numbers` แปลงตัวเลขเป็นตัวหนังสือไทยเพราะ OmniVoice อ่านตัวเลขไม่ออก
-    (ดู vc/thainum.py) — มีผลกับเสียงเท่านั้น หน้าจอยังเห็นเป็นตัวเลขปกติ
+    (ดู vc/thainum.py) ส่วนตัวย่อไทย ("ส.ค." → "สิงหาคม") ถูกคลี่เสมอด้วยเหตุผล
+    เดียวกัน (ดู vc/thaiabbr.py) — ทั้งสองอย่างมีผลกับเสียงเท่านั้น
+    หน้าจอยังเห็นตัวเลขและตัวย่อตามที่โมเดลเขียนมาจริง
     """
     text = _LINK.sub(r"\1", text)
     text = _MD.sub("", text)
+    text = _ORDERED.sub(r"\2 ", text)
     text = text.replace("—", " ").replace("–", " ").replace("|", " ")
+    # ก่อนอ่านตัวเลข เพราะตัวย่อเดือนอยู่ติดกับตัวเลขวันที่เสมอ ("20 ส.ค. 2568")
+    text = speak_abbreviations(text)
     if read_numbers:
         text = speak_numbers(text)
     text = _SPACES.sub(" ", text)
@@ -126,6 +213,7 @@ class ReplyLimiter:
         self.capped = False       # ถึงเพดานแล้ว (ผู้เรียกควรปิดสตรีม)
         self._buf = ""
         self._at_edge = True      # ตอนนี้อยู่ที่รอยต่อประโยคพอดีหรือยัง
+        self._tail = ""           # ท้ายของข้อความที่ปล่อยไปแล้ว (ดู ABBREV_CONTEXT)
 
     @property
     def enabled(self) -> bool:
@@ -208,6 +296,7 @@ class ReplyLimiter:
     def _release(self, n: int, sentence: bool = False,
                  capped: bool = False) -> str:
         piece, self._buf = self._buf[:n], self._buf[n:]
+        self._tail = (self._tail + piece)[-ABBREV_CONTEXT:]
         self.released += len(piece)
         self._at_edge = sentence
         if sentence and piece.strip():
@@ -219,11 +308,14 @@ class ReplyLimiter:
             self._buf = ""
         return piece
 
-    @staticmethod
-    def _sentence_end(buf: str) -> int | None:
+    def _sentence_end(self, buf: str) -> int | None:
         """ตำแหน่งหลังขอบประโยคแรกที่มีเนื้อความนำหน้าจริง (None = ยังไม่มี)"""
         for i, ch in enumerate(buf):
             if ch not in SENTENCE_END:
+                continue
+            # จุดของตัวย่อไทย/เลขหัวข้อไม่ใช่จบประโยค ("20 ส.ค. 2568" ไม่ใช่สามประโยค)
+            if (splits_abbrev(buf, i + 1, self._tail)
+                    or ordered_marker(buf, i, self._tail)):
                 continue
             # จุดทศนิยม/เลขลำดับ ไม่ใช่จบประโยค ("ประมาณ 25.5 องศา")
             if ch == "." and i and buf[i - 1].isdigit():
@@ -270,6 +362,7 @@ class SentenceChunker:
         self.max_target = max_target or target
         self._buf = ""
         self._emitted = 0
+        self._tail = ""      # ท้ายของข้อความที่ปล่อยไปแล้ว (ดู ABBREV_CONTEXT)
 
     @property
     def _limit(self) -> int:
@@ -300,7 +393,8 @@ class SentenceChunker:
         # "25." + "5" แล้วอ่านออกเสียงเป็นสองจำนวน (ดู vc/thainum.py)
         # 1) เครื่องหมายวรรคตอนที่เจอก่อน = จุดตัดที่ดีที่สุด
         for i, ch in enumerate(buf):
-            if ch in STRONG and i + 1 >= min_len and not splits_number(buf, i + 1):
+            if (ch in STRONG and i + 1 >= min_len
+                    and not unsafe_cut(buf, i + 1, self._tail)):
                 cut = i + 1
                 break
         # 2) ไม่มีวรรคตอน (ปกติของภาษาไทย) → ตัดที่วรรคท้ายสุดที่ยังไม่เลยเพดานก้อน
@@ -308,29 +402,30 @@ class SentenceChunker:
             lo = max(min_len, limit // 3)
             hi = min(len(buf), int(limit * 1.6))
             for i in range(hi - 1, lo - 1, -1):
-                if buf[i] in SOFT and not splits_number(buf, i + 1):
+                if buf[i] in SOFT and not unsafe_cut(buf, i + 1, self._tail):
                     cut = i + 1
                     break
             if cut < 0:
                 # ไม่มีวรรคเลยในช่วงนั้น → ใช้วรรคแรกที่เจอถัดไป
                 for i in range(hi, len(buf)):
-                    if buf[i] in SOFT and not splits_number(buf, i + 1):
+                    if buf[i] in SOFT and not unsafe_cut(buf, i + 1, self._tail):
                         cut = i + 1
                         break
         # 3) ยาวเกินเพดานจริง ๆ → ตัดตรง ๆ (ถอยหลังพอให้ไม่ผ่ากลางตัวเลข)
         if cut < 0 and len(buf) >= self.hard_max:
             cut = self.hard_max
             back = cut
-            while back > min_len and splits_number(buf, back):
+            while back > min_len and unsafe_cut(buf, back, self._tail):
                 back -= 1
             # ถอยไม่พ้น (เช่นทั้งก้อนเป็นเลขล้วน) ก็ตัดที่เพดานตามเดิม
             # ดีกว่าปล่อยก้อนสั้นจู๋หรือไม่ตัดเลยแล้วเสียงค้าง
-            if not splits_number(buf, back):
+            if not unsafe_cut(buf, back, self._tail):
                 cut = back
         if cut < 0:
             return None
 
         piece, self._buf = buf[:cut], buf[cut:]
+        self._tail = (self._tail + buf[:cut])[-ABBREV_CONTEXT:]
         piece = piece.strip()
         if not piece:
             return self._take()

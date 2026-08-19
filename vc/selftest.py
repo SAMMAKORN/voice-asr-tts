@@ -14,7 +14,8 @@ import threading
 import time
 
 from .api import ApiClient, ApiError
-from .chat import greeting_text     # ข้อความทักทายมีที่มาที่เดียว
+from .greeting import greeting_text   # ใช้รายการสำรอง ไม่ยิง LLM
+                                     # (นี่คือการตรวจว่าต่อ API ติดไหม จึงต้องไม่พึ่ง API เอง)
 from .config import Config
 
 SAMPLE = "สวัสดีครับ วันนี้อากาศที่กรุงเทพเป็นอย่างไรบ้าง"

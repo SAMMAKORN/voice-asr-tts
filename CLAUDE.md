@@ -43,7 +43,7 @@ The suite runs under pytest (`pytest.ini` at the repo root). The default `addopt
 and never launches a browser — safe to run on any change.
 
 ```bash
-pytest                       # the default suite: ~327 tests, no network, no audio device, ~13s
+pytest                       # the default suite: ~477 tests, no network, no audio device, ~13s
 pytest -m unit               # same set, stated explicitly
 pytest -m browser            # 21 Playwright tests against the real frontend (needs chromium)
 pytest -m network            # tests that need live internet (currently none are marked)
@@ -130,10 +130,52 @@ web/           FastAPI app; WebSession(vc.chat.VoiceChat) + browser-side audio a
   200, but the audio is near-silence that ASR reads back as gibberish. Loudness is cloned too,
   so the clip is peak-normalised before sending — a quiet reference makes the whole system
   whisper. A broken reference disables cloning and logs once; it must never stop speech.
+- `thaiabbr.py` — spells Thai abbreviations out before synthesis (`ส.ค.` → `สิงหาคม`),
+  same reason as `thainum.py` and the same speech-only rule. The table holds **only
+  abbreviations with a single reading**: `ม.` is metre/village/grade/university and `รร.`
+  is school or hotel — that ambiguity is why PyThaiNLP's own expander needs a transformer
+  (`khamyo`), and guessing wrong makes the user hear a word nobody said. A key with an
+  interior dot also matches without its final dot (`ส.ค` happens), but a key without one
+  (`กก.`) never does — `กก` is a real Thai word. The dots themselves are the second half
+  of this bug: `chunker.abbrev_dot()` keeps `ReplyLimiter` from counting `20 ส.ค. 2568`
+  as three sentences (which truncated replies) and keeps `SentenceChunker` from cutting
+  mid-date. It fires on a run of Thai *consonants only* ending at a word boundary,
+  because that is what separates `ส.ค.`/`ปตท.` from a real sentence ending like
+  `องศาครับ.` — those always carry a vowel or tone mark. Both classes hold a short
+  `_tail` of already-released text (`ABBREV_CONTEXT`), or a buffer starting mid-word
+  makes the leftover `บ.` of `ครับ.` look like an abbreviation.
 - `thainum.py` — reads digits out as Thai words before synthesis (`25` → `ยี่สิบห้า`),
   because `k2-fsa/OmniVoice` cannot pronounce arabic numerals. TTS-only: the chat view,
   the history sent back to the model and `transcript.md` all keep the digits.
   `TTS_READ_NUMBERS=0` turns it off.
+- `greeting.py` — the start-of-session greeting. It is written fresh by the LLM on every
+  start, so it never repeats; the static `GREETINGS_*` tuples are the offline fallback
+  (and `selftest.py`'s TTS sample — a connectivity check must not itself depend on the
+  chat endpoint). "Non-repeating" needs memory across *processes*, so the last
+  `RECENT_MAX` greetings live in one JSON file under `LOG_DIR` and are fed back into the
+  prompt as a do-not-repeat list. That file is speech, so `LOG_TRANSCRIPT=0` must not
+  write it. Repeat detection is fuzzy (`SequenceMatcher` ≥ `SIMILAR`), because what the
+  model actually returns is the same sentence with one word changed, and a listener hears
+  that as a repeat. When every attempt still comes back similar, the *model's* text wins
+  over the fallback list — four canned lines repeat harder than a near-miss does.
+  Failure anywhere here falls back and never raises: this runs before the first turn.
+- `thaispell.py` — checks and fixes Thai spelling in the ASR transcript before the text
+  reaches the model (`VoiceChat._spellcheck`, the one funnel every turn's text passes
+  through). **PyThaiNLP is imported lazily**, like `sounddevice`: a machine without it
+  runs everything as before, minus the correction, with one warning in the log.
+  The conservative-by-default guards are the whole point — a corrector that turns
+  right into wrong is worse than none, because nobody can tell the model misheard.
+  Two of them cost real time to rediscover: `pythainlp.spell.correct()` searches
+  edit-distance **2**, which is both slow (~90 ms per unknown word, ~370 ms a sentence,
+  straight onto every turn's latency) and wrong often enough to matter ("นะค่ะ" → "ค่ะ",
+  a whole syllable gone); and a correction may only add/remove/move combining marks —
+  the consonant skeleton has to survive intact (`skeleton()`), or a tokenizer fragment
+  like "เปนอ" becomes "เสนอ", a real word that reads *more* convincingly than the
+  typo it replaced. Correct Thai comes out byte-identical; `tests/test_thaispell.py`
+  holds that line. `TTS_SPELLCHECK` runs the same corrector over the model's reply
+  inside `_tts_loop`, after `clean_for_tts` so the corrector only ever sees plain Thai —
+  speech-path only, exactly like `TTS_READ_NUMBERS`: the chat view, the history sent back
+  to the model and `transcript.md` keep what the model actually wrote.
 - `api.py` — `ApiClient`: ASR/chat-stream/TTS HTTP calls, retry/backoff, and the single place
   `httpx` exceptions are translated into `ApiError`.
 - `tools.py` — LLM tool calling: `web_search` + `open_page`, plus the untrusted-content wrapper.
@@ -304,6 +346,10 @@ concerns that are easy to conflate when tuning:
   (sensitive; usually don't need touching unless the mic or room changes)
 - reply shape — `CHAT_MAX_TOKENS`, `REPLY_MAX_SENTENCES`, `REPLY_MAX_CHARS`
 - speech rendering — `TTS_READ_NUMBERS` (digits → Thai words, `vc/thainum.py`)
+- Thai spelling — `ASR_SPELLCHECK` (the user's transcript), `TTS_SPELLCHECK` (the
+  model's reply, speech only), `SPELL_MIN_FREQ`, `SPELL_MIN_LEN`, `SPELL_KEEP_WORDS`
+  (`vc/thaispell.py`)
+- the greeting — `GREET_FROM_LLM` (`vc/greeting.py`)
 - voice cloning — `TTS_REF_AUDIO`, `TTS_REF_TEXT`, `TTS_REF_GENDER`, `TTS_REF_MAX_SEC`,
   `TTS_REF_NORMALIZE` (`vc/voiceclone.py`; `TTS_REF_GENDER` also drives `voice_gender`,
   which decides whether the model answers with `ครับ` or `ค่ะ`)

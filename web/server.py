@@ -467,7 +467,7 @@ async def api_config() -> JSONResponse:
         "tts_voice": cfg.tts_voice_value,
         "tts_voices": voice_options(cfg),
         # ไม่ส่ง base_url ออกไป — เป็น endpoint ภายในองค์กร (P1-1 ข้อ 4)
-        "api_configured": bool(cfg.base_url and cfg.api_key),
+        "api_configured": cfg.api_configured,
         "mic_sr": cfg.mic_sr,
         "speaker_sr": cfg.speaker_sr,
         "frame_ms": cfg.frame_ms,
