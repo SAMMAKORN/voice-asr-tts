@@ -256,7 +256,7 @@ class WebSession(VoiceChat):
             tts_model=self.cfg.tts_model,
             tts_label=self.cfg.tts_label,
             tts_voice=self.cfg.tts_voice_value,
-            api_configured=bool(self.cfg.base_url and self.cfg.api_key),
+            api_configured=self.cfg.api_configured,
             mic_sr=self.cfg.mic_sr,
             speaker_sr=self.cfg.speaker_sr,
             frame_ms=self.cfg.frame_ms,

@@ -12,7 +12,6 @@ from __future__ import annotations
 import collections
 import logging
 import queue
-import random
 import sys
 import threading
 import time
@@ -25,30 +24,16 @@ from .audio import Microphone, Speaker, mac_input_volume
 from .chunker import ReplyLimiter, SentenceChunker, clean_for_tts, split_for_tts
 from .config import Config
 from .echo import noise_reason
+from .greeting import GREETINGS_MALE, GreetingWriter
 from .logger import SessionLogger
 from .options import RuntimeOptions
 from .phase import BARGE_IN_PHASES, TurnPhase
+from .thaispell import ThaiSpell
 from .tools import TOOLS, ToolRunner, describe, wrap_external
 from .ui import Console, CYAN, GREEN, MAGENTA, YELLOW
 from .vad import VoiceGate
 
-# หลายแบบกันจำเจ — สุ่มเลือกทุกครั้งที่เริ่มระบบ (greet()) แต่ยังคงความหมายเดิมไว้
-GREETINGS_MALE = (
-    "สวัสดีครับ ผมพร้อมคุยแล้ว พูดได้เลยครับ พูดแทรกได้ตลอดเวลา",
-    "สวัสดีครับ ผมฟังอยู่ครับ พูดมาได้เลย พูดแทรกได้ตลอดเวลานะครับ",
-    "หวัดดีครับ พร้อมคุยแล้วครับ อยากถามอะไรพูดได้เลยครับ",
-    "สวัสดีครับ วันนี้มีอะไรให้ช่วยไหมครับ พูดแทรกได้ตลอดเวลาเลย",
-)
-GREETINGS_FEMALE = (
-    "สวัสดีค่ะ ดิฉันพร้อมคุยแล้ว พูดได้เลยค่ะ พูดแทรกได้ตลอดเวลา",
-    "สวัสดีค่ะ ดิฉันฟังอยู่ค่ะ พูดมาได้เลย พูดแทรกได้ตลอดเวลานะคะ",
-    "หวัดดีค่ะ พร้อมคุยแล้วค่ะ อยากถามอะไรพูดได้เลยค่ะ",
-    "สวัสดีค่ะ วันนี้มีอะไรให้ช่วยไหมคะ พูดแทรกได้ตลอดเวลาเลย",
-)
-
-
-def greeting_text(gender: str) -> str:
-    return random.choice(GREETINGS_FEMALE if gender == "female" else GREETINGS_MALE)
+# ตัวข้อความทักทายย้ายไป vc/greeting.py แล้ว (ตอนนี้มาจาก LLM ใหม่ทุกครั้งที่เริ่มระบบ)
 
 
 def search_filler_text(gender: str) -> str:
@@ -109,6 +94,11 @@ class VoiceChat:
         )
 
         self.tools = ToolRunner(cfg) if cfg.web_search else None
+        # แก้คำผิดภาษาไทยของผลถอดเสียงก่อนส่งเข้าเทิร์น (vc/thaispell.py)
+        self.spell = ThaiSpell(enabled=cfg.asr_spellcheck, min_freq=cfg.spell_min_freq,
+                               min_len=cfg.spell_min_len, keep=cfg.spell_keep_words)
+        self.spell.prewarm()      # โหลดพจนานุกรมพื้นหลัง ไม่ให้เทิร์นแรกช้าลง
+        self.greeter = GreetingWriter(cfg, self.api)   # คำทักทายใหม่ทุกครั้งที่เริ่ม
         self.messages: list[dict] = [cfg.system_message()]
         # ผลค้นเว็บของเทิร์นก่อน ๆ — เก็บแยกจาก messages เพราะต้องรอดจากการตัดประวัติ
         self.findings: collections.deque[str] = collections.deque(maxlen=cfg.keep_findings)
@@ -323,6 +313,10 @@ class VoiceChat:
                 if epoch != self.epoch or self.cancel.is_set():
                     continue
                 spoken = clean_for_tts(text, self.cfg.tts_read_numbers)
+                if self.cfg.tts_spellcheck:
+                    # แก้หลัง clean_for_tts: ตัวแก้คำผิดจะได้เห็นภาษาไทยล้วน ๆ
+                    # ไม่ต้องเดากับ Markdown/ลิงก์/ตัวเลขที่ยังไม่ได้แปลง
+                    spoken = self.spell.fix(spoken)[0]
                 if not spoken:
                     continue
                 t0 = time.perf_counter()
@@ -375,7 +369,9 @@ class VoiceChat:
         return True
 
     def enqueue_tts(self, epoch: int, seq: int, text: str) -> None:
-        if not self.cfg.tts_enabled:
+        # ปิด session แล้วห้ามต่อคิวเพิ่ม: เธรด TTS จบไปแล้ว จะไม่มีใครมาลดตัวนับ
+        # ให้อีก แล้ว `_tts_busy()` ค้างเป็น True ตลอดกาล (invariant ของ AC-2.2 พัง)
+        if not self.cfg.tts_enabled or not self.running.is_set():
             return
         self._inc_inflight()
         self.tts_queue.put((epoch, seq, text))
@@ -531,7 +527,22 @@ class VoiceChat:
             return None
 
         self.console.clear_status()
-        return " ".join(parts).strip()
+        return self._spellcheck(epoch, " ".join(parts).strip())
+
+    def _spellcheck(self, epoch: int, text: str) -> str:
+        """แก้คำผิดภาษาไทยของผลถอดเสียง — ด่านเดียวก่อนข้อความเข้าสู่เทิร์น
+
+        แก้ที่นี่ที่เดียว ทุกอย่างปลายน้ำ (การเทียบเสียงสะท้อน, ประวัติสนทนาที่ส่งให้
+        โมเดล, หน้าจอ, transcript) จึงเห็นข้อความเดียวกันหมด · ข้อความดิบก่อนแก้ยัง
+        อยู่ครบใน event `asr` ของ session.jsonl ถ้าต้องย้อนดูว่า ASR ได้ยินว่าอะไร
+        """
+        if not text:
+            return text
+        fixed, changes = self.spell.fix(text)
+        if changes:
+            self.log.event("spell_fix", epoch=epoch, count=len(changes),
+                           detail=", ".join(f"{a}→{b}" for a, b in changes))
+        return fixed
 
     def _pending_utterances(self) -> list[np.ndarray]:
         """ดึงเฉพาะเสียงที่รอในคิวออกมา (เหตุการณ์ชนิดอื่นคืนกลับเข้าคิวตามลำดับ)"""
@@ -788,12 +799,20 @@ class VoiceChat:
         เดิมคำทักทายทำงานนอก `_new_epoch()` จึงพูดแทรกไม่ได้เลย (phase = IDLE →
         `_on_speech_start()` ไม่สั่งหยุดอะไร) ขัดกับที่โฆษณาไว้ทั้งใน README
         และในตัวข้อความทักทายเอง
+
+        ตัวข้อความมาจาก LLM ใหม่ทุกครั้ง (`vc/greeting.py`) การยิงจึงอยู่ใน epoch นี้
+        ด้วยและรับ `cancel` ตัวเดียวกัน — ผู้ใช้ที่พูดใส่ทันทีตอนเปิดระบบต้องขัดได้
+        ตั้งแต่ตอนที่คำทักทายยังแต่งไม่เสร็จ ไม่ใช่ต้องรอให้พูดจบก่อน
         """
         epoch = self._new_epoch(TurnPhase.SPEAKING)
         cancel = self.cancel
         mark = len(self.speaker.finished_tags) if self.speaker is not None else 0
-        greeting = greeting_text(self.cfg.voice_gender)
         try:
+            self.console.status("💭", "กำลังคิดคำทักทาย...", YELLOW)
+            greeting = self.greeter.make(cancel)
+            self.console.clear_status()
+            if not self.running.is_set() or cancel.is_set():
+                return      # ปิดแท็บ/พูดแทรกระหว่างที่ยังแต่งคำทักทายไม่เสร็จ
             self.console.begin("🤖 AI ", GREEN, role="assistant")
             self.console.write(greeting)
             self.console.end()
