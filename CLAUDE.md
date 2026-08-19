@@ -43,7 +43,7 @@ The suite runs under pytest (`pytest.ini` at the repo root). The default `addopt
 and never launches a browser — safe to run on any change.
 
 ```bash
-pytest                       # the default suite: ~233 tests, no network, no audio device, ~13s
+pytest                       # the default suite: ~327 tests, no network, no audio device, ~13s
 pytest -m unit               # same set, stated explicitly
 pytest -m browser            # 21 Playwright tests against the real frontend (needs chromium)
 pytest -m network            # tests that need live internet (currently none are marked)
@@ -116,7 +116,13 @@ web/           FastAPI app; WebSession(vc.chat.VoiceChat) + browser-side audio a
 - `echo.py` — decides whether an interruption was a real person or the AI's own voice leaking
   back through the mic (compares the transcript against what was just spoken).
 - `chunker.py` — `SentenceChunker` (splits streamed LLM text into TTS-sized chunks) and
-  `ReplyLimiter` (caps reply length in code, see below).
+  `ReplyLimiter` (caps reply length in code, see below). `clean_for_tts` is the single
+  funnel every chunk of speech passes through; `splits_number()` keeps chunk boundaries
+  out of the middle of a number.
+- `thainum.py` — reads digits out as Thai words before synthesis (`25` → `ยี่สิบห้า`),
+  because `k2-fsa/OmniVoice` cannot pronounce arabic numerals. TTS-only: the chat view,
+  the history sent back to the model and `transcript.md` all keep the digits.
+  `TTS_READ_NUMBERS=0` turns it off.
 - `api.py` — `ApiClient`: ASR/chat-stream/TTS HTTP calls, retry/backoff, and the single place
   `httpx` exceptions are translated into `ApiError`.
 - `tools.py` — LLM tool calling: `web_search` + `open_page`, plus the untrusted-content wrapper.
@@ -286,6 +292,7 @@ concerns that are easy to conflate when tuning:
 - audio DSP tuning — `VAD_*`, `ECHO_*`, `MIC_*`, `TTS_CHUNK_*`, `BARGE_IN_MIN_CHARS`
   (sensitive; usually don't need touching unless the mic or room changes)
 - reply shape — `CHAT_MAX_TOKENS`, `REPLY_MAX_SENTENCES`, `REPLY_MAX_CHARS`
+- speech rendering — `TTS_READ_NUMBERS` (digits → Thai words, `vc/thainum.py`)
 - network resilience — `HTTP_RETRY_MAX`, `HTTP_RETRY_BASE_MS`
 - tool-calling limits — `SEARCH_*`, `FETCH_MAX_CHARS`, `FETCH_MAX_BYTES`, `TOOL_ROUNDS`,
   `KEEP_FINDINGS`

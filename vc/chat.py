@@ -322,7 +322,7 @@ class VoiceChat:
             try:
                 if epoch != self.epoch or self.cancel.is_set():
                     continue
-                spoken = clean_for_tts(text)
+                spoken = clean_for_tts(text, self.cfg.tts_read_numbers)
                 if not spoken:
                     continue
                 t0 = time.perf_counter()
