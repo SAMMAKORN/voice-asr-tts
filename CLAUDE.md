@@ -174,7 +174,18 @@ web/           FastAPI app; WebSession(vc.chat.VoiceChat) + browser-side audio a
   save those ("พุด" is a real flower), but nothing here has to guess: we know the original,
   so a fuzzy window scan finds the mangled copy and puts our string back. The 0.72 floor is
   measured, not chosen — garbled copies land at 0.86–0.93 while any other phrase in the
-  same sentence stays under 0.46.
+  same sentence stays under 0.46, and a window that is merely a *piece* of the phrase
+  ("สิงห" of "สิงหาคม") is rejected outright rather than padded out to the whole thing.
+  The same repair runs on replies, where the phrases come from `Config.supplied_phrases(at)`
+  — the clock, weekday and month that this turn's system prompt handed over. `at` is taken
+  once in `_respond()` and passed to both `_history()` and the phrase list, or a reply that
+  crosses a minute boundary gets dragged back to the previous minute. Doing it on the stream
+  rather than after the turn is what keeps the screen from having to be rewritten: `_cut()`
+  holds back the tail, refuses to split a phrase (garbled *or* correctly spelled — releasing
+  "วัน" and then repairing the "พฤหัสบดี" that follows produced "วันวันพฤหัสบดี"), and always
+  snaps the release point back to a token boundary, since a half-word handed to the corrector
+  comes back as something else entirely ("แล้วครับ" → "แลิวครูบ"). What it changed is logged
+  as `spell_fix` with `side="reply"`, matching the ASR side's `side="asr"`.
 - `thaispell.py` — checks and fixes Thai spelling in the ASR transcript before the text
   reaches the model (`VoiceChat._spellcheck`, the one funnel every turn's text passes
   through). **PyThaiNLP is imported lazily**, like `sounddevice`: a machine without it

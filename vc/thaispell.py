@@ -49,6 +49,7 @@ import math
 import threading
 import unicodedata
 from collections.abc import Iterable
+from difflib import SequenceMatcher
 
 log = logging.getLogger("voicechat.spell")
 
@@ -180,6 +181,59 @@ def normalize(text: str) -> str:
         return _normalizer(text)
     except Exception:                 # noqa: BLE001 — ห้ามล้มเพราะเรื่องนี้
         return text
+
+
+# ต่ำกว่านี้ถือว่าคนละวลี ไม่ใช่การคัดผิด — วัดจากของจริง: คัดผิดอยู่ที่ 0.86-0.93
+# ส่วนวลีอื่นในประโยคเดียวกันไม่เกิน 0.46 · เผื่อขอบไว้เยอะเพราะเคยเจอ "สิงห"
+# (ท่อนหน้าของ "สิงหาคม" ที่ยังพิมพ์ไม่จบ) ชนเพดาน 0.72 พอดีแล้วโดนเติมจนเกินคำ
+RESTORE_MIN = 0.78
+# ยอมให้หน้าต่างสั้น/ยาวกว่าวลีต้นฉบับได้เท่านี้ (คัดผิดมักทำตัวอักษรหายหรือเกิน)
+RESTORE_SLACK = 3
+
+
+def find_garbled(text: str, phrase: str,
+                 floor: float = RESTORE_MIN) -> tuple[int, int] | None:
+    """หาช่วงใน `text` ที่เป็น `phrase` ฉบับคัดผิด — คืน (ตำแหน่ง, ความยาว)
+
+    คืน None เมื่อไม่มีอะไรคล้ายพอ หรือมีอยู่แล้วแบบสะกดถูก
+    """
+    if not phrase or not text or phrase in text:
+        return None
+    matcher = SequenceMatcher(None, "", phrase)
+    best: tuple[float, int, int] = (floor, -1, 0)
+    span = len(phrase)
+    for start in range(len(text)):
+        for size in range(max(2, span - RESTORE_SLACK),
+                          min(span + RESTORE_SLACK + 1, len(text) - start) + 1):
+            window = text[start:start + size]
+            # หน้าต่างที่เป็น "ท่อนหนึ่ง" ของวลีอยู่แล้ว ไม่ใช่ของที่คัดผิด แต่เป็นของ
+            # ที่ยังพิมพ์มาไม่ครบหรือถูกหั่นตอนสตรีม เติมให้เต็มจะได้คำซ้อน
+            # ("พฤหัสบดี" → "วันพฤหัสบดี" ต่อท้าย "วัน" เดิมเป็น "วันวันพฤหัสบดี")
+            if window in phrase:
+                continue
+            matcher.set_seq1(window)
+            # สองด่านนี้ตัดงานทิ้งได้เกือบหมดโดยไม่ต้องคำนวณ ratio จริง
+            if matcher.real_quick_ratio() <= best[0]:
+                continue
+            if matcher.quick_ratio() <= best[0]:
+                continue
+            score = matcher.ratio()
+            if score > best[0]:
+                best = (score, start, size)
+    return None if best[1] < 0 else (best[1], best[2])
+
+
+def restore(text: str, phrase: str) -> str:
+    """คืนวลีที่เราป้อนให้โมเดล ให้กลับเป็นรูปที่สะกดถูก (ถ้ามันคัดมาเพี้ยน)
+
+    ไม่ใช่การแก้คำผิดแบบเดา — ปลายทางคือสตริงที่เราส่งไปเองเป๊ะ ๆ จึงกล้าแก้
+    ในที่ที่พจนานุกรมช่วยไม่ได้ ("พุดแทรก" → "พูดแทรก": "พุด" เป็นดอกไม้จริง ๆ
+    ความถี่ 62,240 ตัวแก้คำผิดไม่มีทางแตะ)
+    """
+    hit = find_garbled(text, phrase)
+    if hit is None:
+        return text
+    return text[:hit[0]] + phrase + text[hit[0] + hit[1]:]
 
 
 def skeleton(word: str) -> str:
@@ -431,17 +485,76 @@ class StreamSpell:
     เพราะมองไม่เห็นข้อความอีกฝั่ง — แลกกับการที่หน้าจอยังไหลตามคำตอบทันที
     """
 
-    def __init__(self, spell: ThaiSpell) -> None:
+    def __init__(self, spell: ThaiSpell, phrases: Iterable[str] = ()) -> None:
         self.spell = spell
+        # วลีที่ prompt ของเทิร์นนี้ป้อนให้โมเดลไป (ดู `Config.supplied_phrases()`)
+        self.phrases = tuple(p for p in phrases if p)
+        # ทุกอย่างที่เปลี่ยนไป เก็บไว้ให้ผู้เรียกบันทึกได้ — เส้นทาง ASR มี event
+        # `spell_fix` มาตั้งแต่แรก ส่วนคำตอบเคยเงียบสนิท ไล่ย้อนไม่ได้เลยว่า
+        # ตัวแก้คำไปแตะอะไร (ต้องรื้อโค้ดมาลองเองถึงจะรู้ว่าไม่ใช่ฝีมือมัน)
+        self.changes: list[tuple[str, str]] = []
         self._buf = ""
 
     @property
     def enabled(self) -> bool:
-        return self.spell.enabled
+        return self.spell.enabled or bool(self.phrases)
+
+    def _cut(self, tokens: list[str]) -> int:
+        """ปล่อยได้ถึงตัวอักษรที่เท่าไหร่ — 0 = ยังไม่ปล่อยอะไรเลย
+
+        เพดานแรกคือขอบคำจากตัวตัดคำ (กันปล่อยครึ่งคำ) เพดานที่สองมาจากการซ่อม
+        วลี: วลีที่กำลังจะถูกซ่อมอาจยังพิมพ์มาไม่ครบ หรือคร่อมรอยปล่อยพอดี
+        ปล่อยไปก่อนแล้วค่อยเจอทีหลังก็สายเกินแก้ เพราะข้อความขึ้นจอไปแล้ว
+        """
+        if len(tokens) <= STREAM_KEEP:
+            return 0
+        bounds: list[int] = []
+        acc = 0
+        for token in tokens[:-STREAM_KEEP]:
+            acc += len(token)
+            bounds.append(acc)
+        limit = bounds[-1]
+        if self.phrases:
+            # กันท้ายไว้ให้ยาวกว่าวลีที่ยาวที่สุด วลีที่เพิ่งมาครึ่งเดียวจะได้ไม่หลุด
+            keep = max(len(p) for p in self.phrases) + RESTORE_SLACK + 1
+            limit = min(limit, len(self._buf) - keep)
+            for phrase in self.phrases:
+                # ทั้งที่คัดผิด (จะถูกซ่อม) และที่สะกดถูกอยู่แล้ว — ผ่ากลางอันหลัง
+                # ก็พังเหมือนกัน เพราะท่อนหลังที่ปล่อยตามไปทีหลังจะดูเหมือนของคัดผิด
+                for start, size in self._spans(phrase):
+                    if start < limit < start + size:
+                        limit = start
+        # เพดานสองอันข้างบนเป็นตำแหน่งตัวอักษรดิบ ต้องถอยกลับมาที่ขอบคำเสมอ —
+        # ปล่อยครึ่งคำออกไปแล้วตัวแก้คำผิดจะเห็นเศษคำ แล้วแก้มันเป็นอย่างอื่น
+        # (ของจริงที่เจอ: "แล้วครับ" กลายเป็น "แลิวครูบ")
+        return max((b for b in bounds if b <= limit), default=0)
+
+    def _spans(self, phrase: str) -> list[tuple[int, int]]:
+        """ช่วงในบัฟเฟอร์ที่เป็นวลีนี้ — ทั้งที่สะกดถูกและที่คัดผิด"""
+        out: list[tuple[int, int]] = []
+        at = self._buf.find(phrase)
+        while at >= 0:
+            out.append((at, len(phrase)))
+            at = self._buf.find(phrase, at + 1)
+        hit = find_garbled(self._buf, phrase)
+        if hit is not None:
+            out.append(hit)
+        return out
+
+    def _fix(self, text: str) -> str:
+        if self.spell.enabled:
+            text, changed = self.spell.fix(text)
+            self.changes.extend(changed)
+        for phrase in self.phrases:
+            fixed = restore(text, phrase)
+            if fixed != text:
+                self.changes.append((text, fixed))
+            text = fixed
+        return text
 
     def feed(self, text: str) -> str:
         """รับชิ้นใหม่ คืนส่วนที่แก้เสร็จแล้วและปล่อยออกได้ (อาจเป็นค่าว่าง)"""
-        if not self.spell.enabled:
+        if not self.enabled:
             return text
         self._buf += text
         if len(self._buf) < STREAM_MIN:
@@ -451,19 +564,18 @@ class StreamSpell:
             out, self._buf = self._buf, ""
             return out
         try:
-            tokens = list(eng.tokenize(self._buf))
+            cut = self._cut(list(eng.tokenize(self._buf)))
         except Exception:             # noqa: BLE001 — ห้ามล้มกลางคำตอบ
             out, self._buf = self._buf, ""
             return out
-        if len(tokens) <= STREAM_KEEP:
+        if cut <= 0:
             return ""
-        head = "".join(tokens[:-STREAM_KEEP])
-        self._buf = self._buf[len(head):]
-        return self.spell.fix(head)[0]
+        head, self._buf = self._buf[:cut], self._buf[cut:]
+        return self._fix(head)
 
     def flush(self) -> str:
         """ปล่อยส่วนที่ค้างทั้งหมด — เรียกตอนสตรีมจบหรือถูกพูดแทรก"""
         rest, self._buf = self._buf, ""
-        if not rest or not self.spell.enabled:
+        if not rest or not self.enabled:
             return rest
-        return self.spell.fix(rest)[0]
+        return self._fix(rest)
