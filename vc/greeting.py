@@ -35,6 +35,7 @@ from .api import ApiError
 from .config import (THAI_DAYS, THAI_MONTHS, Config, persona_instruction,
                      thai_clock)
 from .logger import FILE_MODE, chmod_quiet, private_dir
+from .thaispell import normalize
 
 log = logging.getLogger("voicechat.greeting")
 
@@ -79,6 +80,41 @@ TONES = (
     "น้ำเสียงสดใสร่าเริง",
     "น้ำเสียงสุขุมหนักแน่น",
 )
+# วลีที่ "เรา" เป็นคนป้อนให้โมเดลไป มันจึงมีหน้าที่คัดลอกกลับมาให้ตรง ไม่ใช่แต่งเอง
+# โมเดลนี้คัดผิดเป็นประจำ ("พูดแทรก" → "พุดแทรก", "ห้าทุ่ม" → "ห้าทึ่") ซึ่งตัวแก้คำผิด
+# ช่วยไม่ได้เพราะ "พุด" เป็นคำไทยจริง · แต่ที่นี่ไม่ต้องเดา เรารู้อยู่แล้วว่าต้นฉบับคืออะไร
+RESTORE = ("พูดแทรก",)
+# ต่ำกว่านี้ถือว่าคนละวลี ไม่ใช่การคัดผิด — วัดจากของจริง: คัดผิดอยู่ที่ 0.86-0.93
+# ส่วนวลีอื่นในประโยคเดียวกันไม่เกิน 0.46
+RESTORE_MIN = 0.72
+
+
+def restore(text: str, phrase: str) -> str:
+    """คืนวลีที่เราป้อนให้โมเดล ให้กลับเป็นรูปที่สะกดถูก (ถ้ามันคัดมาเพี้ยน)
+
+    ไล่หน้าต่างความยาวใกล้เคียงกับ `phrase` ทั้งข้อความ แล้วแทนที่อันที่คล้ายที่สุด
+    ถ้าคล้ายพอ · ไม่ใช่การแก้คำผิดแบบเดา — ปลายทางคือสตริงที่เราส่งไปเองเป๊ะ ๆ
+    """
+    if not phrase or phrase in text:
+        return text
+    matcher = SequenceMatcher(None, "", phrase)
+    best = (0.0, -1, 0)
+    span = len(phrase)
+    for start in range(len(text)):
+        for size in range(max(2, span - 3), min(span + 4, len(text) - start) + 1):
+            matcher.set_seq1(text[start:start + size])
+            if matcher.real_quick_ratio() <= best[0]:
+                continue
+            if matcher.quick_ratio() <= best[0]:
+                continue
+            score = matcher.ratio()
+            if score > best[0]:
+                best = (score, start, size)
+    if best[0] < RESTORE_MIN:
+        return text
+    return text[:best[1]] + phrase + text[best[1] + best[2]:]
+
+
 # ร้อนกว่าค่าสนทนาปกติเล็กน้อย — คำทักทายไม่มีคำตอบถูก/ผิด มีแต่ซ้ำ/ไม่ซ้ำ
 # เคยตั้ง 1.0 แล้วได้ความหลากหลายมาแลกกับภาษาไทยพัง ("แล่ว", "ห้าทึ่", "ก้ได้",
 # "ห้าวทุ่ม" — จาก 5 ครั้งติดกัน) ตัวแก้คำผิดช่วยไม่ได้เพราะส่วนใหญ่เป็นคำจริง
@@ -110,10 +146,16 @@ def is_repeat(text: str, recent: object) -> bool:
 
 
 def clean(text: str) -> str:
-    """ตัดสิ่งที่ไม่ควรถูกอ่านออกเสียงทิ้ง แล้วคืนคำทักทายบรรทัดเดียว"""
+    """ตัดสิ่งที่ไม่ควรถูกอ่านออกเสียงทิ้ง แล้วคืนคำทักทายบรรทัดเดียว
+
+    `normalize()` ปิดท้าย — โมเดลพิมพ์วรรณยุกต์ซ้อนออกมาได้จริง ("สดชื่่น") แล้ว
+    TTS อ่านเพี้ยน · เป็นการรวมรูปอักขระระดับ Unicode ไม่ใช่การเดาคำ คำทักทายจึง
+    ผ่านขั้นนี้เสมอ ต่างจาก CHAT_SPELLCHECK ที่เป็นตัวแก้คำเต็มรูปแบบและมีสวิตช์
+    """
     text = _MD.sub("", text.strip())
     text = _PREFIX.sub("", text)
     text = _SPACES.sub(" ", text).strip().strip(_QUOTES).strip()
+    text = normalize(text)
     if len(text) <= MAX_CHARS:
         return text
     # ตัดที่ช่องว่างสุดท้าย ไม่ใช่กลางคำ — ภาษาไทยไม่มีช่องว่างระหว่างคำ การตัดดิบ ๆ
@@ -157,9 +199,9 @@ class GreetingWriter:
             log.warning("จำคำทักทายที่ใช้ไปแล้วไม่ได้ (%s)", exc)
 
     # -------------------------------------------------------------------- prompt
-    def _messages(self, recent: list[str], angle: str = "",
-                  tone: str = "") -> list[dict]:
-        at = self.cfg.now()
+    def _messages(self, recent: list[str], angle: str = "", tone: str = "",
+                  at: object = None) -> list[dict]:
+        at = at if at is not None else self.cfg.now()
         # คำอ่านไทยของเวลาต้องยื่นให้เลย ไม่ใช่ให้โมเดลแปลงเลขเอง — ที่ได้จริง
         # คือ "22 โมงกว่าๆ" ซึ่งไม่มีใครพูด และคำทักทายนี้ถูกอ่านออกเสียงทันที
         stamp = (f"ตอนนี้คือ{THAI_DAYS[at.weekday()]}ที่ {at.day} "
@@ -195,14 +237,21 @@ class GreetingWriter:
 
     def _ask(self, recent: list[str], cancel: threading.Event) -> str:
         parts: list[str] = []
-        msgs = self._messages(recent, random.choice(ANGLES), random.choice(TONES))
+        at = self.cfg.now()
+        msgs = self._messages(recent, random.choice(ANGLES), random.choice(TONES), at)
         for piece in self.api.chat_stream(msgs, cancel,
                                           temperature=GREET_TEMPERATURE):
             parts.append(piece)
             # กันโมเดลที่ไม่ยอมหยุด — คำทักทายยาวเกินเพดานอยู่แล้วตั้งแต่ตรงนี้
             if sum(len(p) for p in parts) > MAX_CHARS * 3:
                 break
-        return clean("".join(parts))
+        text = clean("".join(parts))
+        # ซ่อมเฉพาะวลีที่เราป้อนไปเอง — คำอ่านเวลา ชื่อวัน และชื่อเดือน ล้วนอยู่ใน
+        # prompt เดียวกันนี้ทั้งหมด ("วันพฤหัสบดี" กลับมาเป็น "วันพฤหัสดี" ก็เจอมาแล้ว)
+        for phrase in (*RESTORE, thai_clock(at), THAI_DAYS[at.weekday()],
+                       THAI_MONTHS[at.month - 1]):
+            text = restore(text, phrase)
+        return text
 
     # ---------------------------------------------------------------------- ใช้งาน
     def make(self, cancel: threading.Event | None = None) -> str:

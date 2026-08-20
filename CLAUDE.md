@@ -162,7 +162,19 @@ web/           FastAPI app; WebSession(vc.chat.VoiceChat) + browser-side audio a
   An identical prompt every run makes the model return the same shape every run, however
   loudly the do-not-repeat list objects, so the prompt itself is randomised: one of
   `ANGLES` × one of `TONES` (42 pairs) plus `GREET_TEMPERATURE`, which overrides
-  `CHAT_TEMPERATURE` for this one call only.
+  `CHAT_TEMPERATURE` for this one call only. 1.0 was too hot: this model's Thai spelling
+  falls apart at that setting ("แล่ว", "ห้าทึ่", "ก้ได้" — five runs out of five), so the
+  variety comes from the prompt instead. `clean()` ends with `thaispell.normalize()`,
+  which is Unicode-level tidying (a doubled tone mark in "สดชื่่น", "เเ" for "แ") and not
+  word correction — no dictionary, nothing to guess wrong, so it needs no switch and runs
+  even when every `*_SPELLCHECK` is off. It imports `pythainlp.util.normalize` on its own
+  rather than waking `_Engine`, whose corpora cost ~0.4 s that this step never uses.
+  `restore()` handles the other half: the model garbles phrases *we handed it* — "พูดแทรก"
+  comes back as "พุดแทรก", `thai_clock()`'s "ห้าทุ่ม" as "ห้าทึ่". No spell checker can
+  save those ("พุด" is a real flower), but nothing here has to guess: we know the original,
+  so a fuzzy window scan finds the mangled copy and puts our string back. The 0.72 floor is
+  measured, not chosen — garbled copies land at 0.86–0.93 while any other phrase in the
+  same sentence stays under 0.46.
 - `thaispell.py` — checks and fixes Thai spelling in the ASR transcript before the text
   reaches the model (`VoiceChat._spellcheck`, the one funnel every turn's text passes
   through). **PyThaiNLP is imported lazily**, like `sounddevice`: a machine without it
