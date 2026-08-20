@@ -6,6 +6,12 @@
       "runtimeExecutable": ".venv/bin/python3",
       "runtimeArgs": ["-m", "web.server", "--port", "8077"],
       "port": 8077
+    },
+    {
+      "name": "web-win",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "web.server", "--port", "8077"],
+      "port": 8077
     }
   ]
 }

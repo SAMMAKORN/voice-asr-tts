@@ -159,6 +159,10 @@ web/           FastAPI app; WebSession(vc.chat.VoiceChat) + browser-side audio a
   that as a repeat. When every attempt still comes back similar, the *model's* text wins
   over the fallback list — four canned lines repeat harder than a near-miss does.
   Failure anywhere here falls back and never raises: this runs before the first turn.
+  An identical prompt every run makes the model return the same shape every run, however
+  loudly the do-not-repeat list objects, so the prompt itself is randomised: one of
+  `ANGLES` × one of `TONES` (42 pairs) plus `GREET_TEMPERATURE`, which overrides
+  `CHAT_TEMPERATURE` for this one call only.
 - `thaispell.py` — checks and fixes Thai spelling in the ASR transcript before the text
   reaches the model (`VoiceChat._spellcheck`, the one funnel every turn's text passes
   through). **PyThaiNLP is imported lazily**, like `sounddevice`: a machine without it
@@ -172,10 +176,31 @@ web/           FastAPI app; WebSession(vc.chat.VoiceChat) + browser-side audio a
   the consonant skeleton has to survive intact (`skeleton()`), or a tokenizer fragment
   like "เปนอ" becomes "เสนอ", a real word that reads *more* convincingly than the
   typo it replaced. Correct Thai comes out byte-identical; `tests/test_thaispell.py`
-  holds that line. `TTS_SPELLCHECK` runs the same corrector over the model's reply
-  inside `_tts_loop`, after `clean_for_tts` so the corrector only ever sees plain Thai —
-  speech-path only, exactly like `TTS_READ_NUMBERS`: the chat view, the history sent back
-  to the model and `transcript.md` keep what the model actually wrote.
+  holds that line. A third guard came later and is just as load-bearing: a correction
+  may not *lose* combining marks (`marks()`), because `skeleton()` ignores them entirely,
+  so deleting one always passes the skeleton check — that is how "เพือน" got "corrected"
+  to "เพอน" (a real word, frequency above the floor) instead of "เพื่อน". ASR drops marks,
+  it does not add them.
+  Per-word correction alone barely fired, because the tokenizer stumbles on the typo and
+  swallows the next word's first letter ("อากาศเปนอยางไร" → "อากาศ|เปนอ|ยาง|ไร"): the
+  fragment is not a word and nothing has its consonant skeleton, so the whole sentence
+  came back untouched — and that is the *common* ASR error, not an edge case. `_resplit()`
+  therefore joins suspect fragments back with their neighbours and re-segments the span
+  with a DP that scores `log(freq)` per piece minus a penalty per correction, per piece,
+  and per piece shorter than `min_len`. All three penalties are load-bearing: without them
+  "เป็น|อย่าง" loses to "เป้|นอ|ยาง", because two-character junk like "นอ" is in the
+  dictionary with a frequency of 40 million. The span's whole-skeleton check still has the
+  final say, and every window is scored *per character* so a short badly-explained span
+  cannot beat a wider well-explained one.
+  Two switches decide how far the corrector reaches. `TTS_SPELLCHECK` runs it over the
+  model's reply inside `_tts_loop`, after `clean_for_tts` so the corrector only ever sees
+  plain Thai — speech path only. `CHAT_SPELLCHECK` (default on) runs it *before* the reply
+  reaches the screen, so the chat view, the history sent back to the model, `transcript.md`
+  and the speech all agree. That one needs `StreamSpell`, because the reply arrives a few
+  characters at a time and half a word looks exactly like a typo: it buffers, re-tokenizes,
+  and releases only what the tokenizer confirms is finished, holding the last two tokens
+  back. `first_token_ms` is therefore measured in `push()` where the model's text arrives,
+  not in `emit()` where the corrector lets it out.
 - `api.py` — `ApiClient`: ASR/chat-stream/TTS HTTP calls, retry/backoff, and the single place
   `httpx` exceptions are translated into `ApiError`.
 - `tools.py` — LLM tool calling: `web_search` + `open_page`, plus the untrusted-content wrapper.
@@ -183,6 +208,14 @@ web/           FastAPI app; WebSession(vc.chat.VoiceChat) + browser-side audio a
 - `logger.py` — per-session JSONL + `transcript.md`, directory permissions, retention.
 - `selftest.py` — the one shared connectivity check used by both the CLI and the web server.
 - `ui.py` — terminal rendering.
+
+A failed turn gets a **`role="system"` message in the conversation stream**, not just a line in
+the log panel: `console.error()` alone left the user staring at their own question with nothing
+after it, unable to tell a broken system from an AI that chose not to answer. `vc/api.py`'s
+`explain()` turns the raw `ApiError` into one sentence that names the fix ("บัญชีนี้ไม่มีสิทธิ์
+เรียกโมเดลที่ตั้งไว้ (403) — ตรวจชื่อโมเดลใน .env"); the full text still goes to `session.jsonl`
+and the log panel. The message is never appended to `self.messages` — it is not something the AI
+said — and `app.js` keeps it out of the turn counter for the same reason.
 
 `web/session.py`'s `WebSession` subclasses `vc.chat.VoiceChat` and swaps in duck-typed adapters
 from `web/bridge.py` (`WebMic`, `WebSpeaker`, `WebConsole`) that mimic the terminal's
@@ -346,9 +379,9 @@ concerns that are easy to conflate when tuning:
   (sensitive; usually don't need touching unless the mic or room changes)
 - reply shape — `CHAT_MAX_TOKENS`, `REPLY_MAX_SENTENCES`, `REPLY_MAX_CHARS`
 - speech rendering — `TTS_READ_NUMBERS` (digits → Thai words, `vc/thainum.py`)
-- Thai spelling — `ASR_SPELLCHECK` (the user's transcript), `TTS_SPELLCHECK` (the
-  model's reply, speech only), `SPELL_MIN_FREQ`, `SPELL_MIN_LEN`, `SPELL_KEEP_WORDS`
-  (`vc/thaispell.py`)
+- Thai spelling — `ASR_SPELLCHECK` (the user's transcript), `CHAT_SPELLCHECK` (the
+  model's reply, screen and speech both), `TTS_SPELLCHECK` (the model's reply, speech
+  only), `SPELL_MIN_FREQ`, `SPELL_MIN_LEN`, `SPELL_KEEP_WORDS` (`vc/thaispell.py`)
 - the greeting — `GREET_FROM_LLM` (`vc/greeting.py`)
 - voice cloning — `TTS_REF_AUDIO`, `TTS_REF_TEXT`, `TTS_REF_GENDER`, `TTS_REF_MAX_SEC`,
   `TTS_REF_NORMALIZE` (`vc/voiceclone.py`; `TTS_REF_GENDER` also drives `voice_gender`,
@@ -370,6 +403,17 @@ All timestamps go through the timezone helpers in `vc/config.py`, defaulting to 
 and overridable with `APP_TZ`. Do not call bare `datetime.now()` or `time.localtime()` anywhere —
 containers usually run as UTC, which silently shifted every log name and every "what time is it"
 answer by 7 hours.
+
+The system prompt carries the current date and time, so `_history()` **rebuilds it on every
+turn** rather than reusing `self.messages[0]`. That slot is still kept (history trimming is
+written as `self.messages[1:]`) but its content is never sent: a browser tab left open
+overnight was telling the model that "now" is whenever the page was loaded.
+
+The clock is handed over as words as well as digits — `thai_clock()` renders 22:39 as
+"สี่ทุ่มสามสิบเก้านาที". Given only `เวลา 22:39 น.` the model invents its own reading and says
+"22 โมง", which no one says (Thai has no *โมง* past eleven) and which goes straight out of the
+speaker. `vc/thainum.py` still does the formal reading ("ยี่สิบสองนาฬิกา…") on the TTS path;
+`thai_clock()` is for prompts, where conversational Thai is what's wanted.
 
 ### Logging
 

@@ -203,6 +203,12 @@ function applyTheme(name, persist) {
 }
 
 // ───────────────────────────────────────────────────────── บทสนทนา
+/* ป้ายชื่อผู้พูดของแต่ละบทบาท · system = ข้อความจากตัวระบบเอง (เช่นเรียกโมเดล
+   ไม่สำเร็จ) ไม่ใช่คำพูดของ AI จึงต้องไม่ขึ้นว่า "AI" และไม่ถูกนับเป็นข้อความ
+   ในบทสนทนา */
+const WHO = { user: 'คุณ', assistant: 'AI', system: 'ระบบ' };
+const SAID = { user: 'คุณพูดว่า', assistant: 'AI ตอบว่า', system: 'ระบบแจ้งว่า' };
+
 function beginMsg(role, label) {
   const empty = $('empty');
   if (empty) empty.remove();
@@ -211,7 +217,7 @@ function beginMsg(role, label) {
   el.className = 'msg live';
   el.dataset.role = role;
   el.innerHTML = '<div class="who"></div><div class="body"></div>';
-  el.querySelector('.who').textContent = role === 'user' ? 'คุณ' : 'AI';
+  el.querySelector('.who').textContent = WHO[role] || WHO.assistant;
   $('stream').appendChild(el);
   msgEl = el;
   scrollStream();
@@ -238,8 +244,9 @@ function announce(text) {
 function endMsg(note) {
   if (!msgEl) return;
   msgEl.classList.remove('live');
+  const role = msgEl.dataset.role;
   const said = msgEl.querySelector('.body').textContent.trim();
-  const who = msgEl.dataset.role === 'user' ? 'คุณพูดว่า' : 'AI ตอบว่า';
+  const who = SAID[role] || SAID.assistant;
   if (said) announce(`${who} ${said}${note ? ` (${note})` : ''}`);
   if (note) {
     const b = document.createElement('span');
@@ -248,8 +255,10 @@ function endMsg(note) {
     msgEl.querySelector('.body').appendChild(b);
   }
   msgEl = null;
-  turns++;
-  $('turn-count').textContent = `${turns} ข้อความ`;
+  if (role !== 'system') {          // ข้อความแจ้งเตือนไม่ใช่เทิร์นของบทสนทนา
+    turns++;
+    $('turn-count').textContent = `${turns} ข้อความ`;
+  }
   scrollStream();
 }
 

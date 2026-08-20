@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import random
+import re
 import threading
 import time
 import wave
@@ -32,6 +33,42 @@ BACKOFF_CAP = 8.0          # เพดานเวลาคอยต่อคร
 
 class ApiError(RuntimeError):
     pass
+
+
+# สถานะ HTTP -> สาเหตุแบบที่บอกผู้ใช้ได้ว่า "ต้องไปแก้ตรงไหน"
+_WHY_STATUS = {
+    401: "API key ไม่ถูกต้องหรือหมดอายุ (401) — ตรวจ API_KEY ใน .env",
+    403: "บัญชีนี้ไม่มีสิทธิ์เรียกโมเดลที่ตั้งไว้ (403) — ตรวจชื่อโมเดลใน .env",
+    404: "ไม่พบโมเดลหรือปลายทางนี้ (404) — ตรวจชื่อโมเดลและ API_BASE_URL ใน .env",
+    413: "ข้อความยาวเกินที่เซิร์ฟเวอร์รับไหว (413)",
+    429: "ถูกจำกัดจำนวนครั้งที่เรียก (429) — รอสักครู่แล้วลองใหม่",
+}
+_STATUS = re.compile(r"^\w+ (\d{3}):")
+
+
+def explain(error: str) -> str:
+    """แปลข้อความผิดพลาดดิบให้เป็นประโยคเดียวที่ผู้ใช้อ่านรู้เรื่อง
+
+    ตัวเต็ม (JSON ของเซิร์ฟเวอร์, repr ของ exception) ยังถูกเก็บครบใน
+    session.jsonl และแผงบันทึกระบบเสมอ ที่นี่คือสิ่งที่ไปโผล่ในช่องแชท จึงต้อง
+    สั้นและบอกทางแก้ — ผู้ใช้ที่เห็น "chat 403: {\"error\":{...}}" กลางบทสนทนา
+    ได้ข้อมูลเท่ากับไม่เห็นอะไรเลย
+    """
+    m = _STATUS.match(error)
+    if m:
+        status = int(m.group(1))
+        if status in _WHY_STATUS:
+            return _WHY_STATUS[status]
+        if status >= 500:
+            return f"เซิร์ฟเวอร์โมเดลขัดข้อง ({status}) — ลองใหม่อีกครั้ง"
+        return f"เซิร์ฟเวอร์ตอบกลับเป็นข้อผิดพลาด ({status})"
+    if "เชื่อมต่อไม่สำเร็จ" in error:
+        return "ต่อเซิร์ฟเวอร์ไม่ได้ — ตรวจ API_BASE_URL ใน .env และการเชื่อมต่อเน็ต"
+    if "สตรีมขาดกลางทาง" in error:
+        return "การเชื่อมต่อขาดกลางคัน — ลองถามใหม่อีกครั้ง"
+    if "Timeout" in error or "timeout" in error:
+        return "เซิร์ฟเวอร์ไม่ตอบภายในเวลาที่กำหนด — ลองใหม่อีกครั้ง"
+    return "เรียกโมเดลไม่สำเร็จ — ดูรายละเอียดในแผงบันทึกระบบ"
 
 
 def _retryable_status(status: int) -> bool:
@@ -184,7 +221,7 @@ class ApiClient:
     def _stream_once(
         self, messages: list[dict], cancel: threading.Event,
         tools: list[dict] | None, tool_choice: str = "auto",
-        allow_retry: bool = True,
+        allow_retry: bool = True, temperature: float | None = None,
     ) -> Iterator[tuple[str, object]]:
         """สตรีมหนึ่งรอบ คืนเป็นคู่ ("text", ข้อความ) หรือ ("tool", ชิ้นส่วน tool_call)
 
@@ -195,7 +232,8 @@ class ApiClient:
             "model": self.cfg.chat_model,
             "messages": messages,
             "stream": True,
-            "temperature": self.cfg.temperature,
+            "temperature": (self.cfg.temperature if temperature is None
+                            else temperature),
             "max_tokens": self.cfg.max_tokens,
         }
         if tools:
@@ -266,13 +304,17 @@ class ApiClient:
         self, messages: list[dict], cancel: threading.Event,
         tools: list[dict] | None = None,
         run_tool: Callable[[str, dict], str] | None = None,
-        max_rounds: int = 2,
+        max_rounds: int = 2, temperature: float | None = None,
     ) -> Iterator[str]:
         """สตรีมคำตอบทีละ token; หยุดทันทีเมื่อ cancel ถูกตั้ง
 
         ถ้าส่ง tools + run_tool มาด้วย และโมเดลขอเรียกเครื่องมือ (เช่น ค้นเว็บ)
         จะรันให้แล้วส่งผลกลับเข้าไปให้โมเดลตอบต่อ วนได้สูงสุด max_rounds รอบ
         ข้อความที่ yield ออกไปยังเป็น text ล้วนเหมือนเดิม ฝั่ง TTS จึงไม่ต้องแก้อะไร
+
+        `temperature` ทับค่าใน .env เฉพาะการเรียกครั้งนี้ — คำทักทาย (vc/greeting.py)
+        ต้องการความหลากหลายสูงกว่าการสนทนาปกติ ส่วนบทสนทนาที่ผู้ใช้จูนไว้เองต้องไม่
+        ถูกกระทบ · None = ใช้ค่าจาก .env ตามเดิม
         """
         msgs = list(messages)
         can_use = bool(tools and run_tool)
@@ -292,7 +334,7 @@ class ApiClient:
             # พูดออกไปแล้วห้ามยิงซ้ำ ไม่งั้นผู้ใช้ได้ยินท่อนเดิมสองครั้ง (AC-6.4)
             for kind, payload in self._stream_once(
                     msgs, cancel, tools if can_use else None, choice,
-                    allow_retry=not spoke):
+                    allow_retry=not spoke, temperature=temperature):
                 if kind == "text":
                     said += payload  # type: ignore[operator]
                     spoke = True

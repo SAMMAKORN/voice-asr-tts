@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from vc.thaispell import ThaiSpell, engine, skeleton
+from vc.thaispell import StreamSpell, ThaiSpell, engine, skeleton
 
 pytestmark = pytest.mark.unit
 
@@ -332,3 +332,71 @@ def _events(chat) -> list[dict]:
     return [json.loads(line)
             for line in chat.log.jsonl.read_text(encoding="utf-8").splitlines()
             if line.strip()]
+
+
+# ─────────────────────── 7. แบ่งคำใหม่: ทำให้ตัวแก้คำได้ทำงานจริงกลางประโยค
+# เดิมตัวตัดคำสะดุดตรงคำผิดแล้วกลืนตัวแรกของคำถัดไป ("เปนอ|ยาง|ไร") ก้อนที่ได้
+# ไม่ใช่คำ ตัวแก้คำจึงเงียบสนิททั้งประโยค — ซึ่งเป็นคำผิดจาก ASR ส่วนใหญ่
+@needs_pythainlp
+@pytest.mark.parametrize("before,after", [
+    ("อากาศเปนอยางไร", "อากาศเป็นอย่างไร"),
+    ("คุณเปนอยางไรบ้าง", "คุณเป็นอย่างไรบ้าง"),
+    ("วันนีอากาศดีมาก", "วันนี้อากาศดีมาก"),
+    ("เพือนผมชือสมชาย", "เพื่อนผมชื่อสมชาย"),
+])
+def test_a_typo_glued_to_its_neighbour_is_still_corrected(spell, before, after) -> None:
+    assert spell.fix(before)[0] == after
+
+
+@needs_pythainlp
+def test_the_change_list_names_the_word_not_the_whole_span(spell) -> None:
+    """บันทึกต้องบอกเป็นคำ ("เปน→เป็น") ไม่ใช่ทั้งช่วง ("เปนคนดี→เป็นคนดี")"""
+    assert spell.fix("อากาศเปนอยางไร")[1] == [("เปน", "เป็น"), ("อยาง", "อย่าง")]
+
+
+@needs_pythainlp
+@pytest.mark.parametrize("text", CORRECT_THAI)
+def test_resegmenting_never_touches_correct_thai(spell, text) -> None:
+    """ด่านเดิมข้อ 1 อีกครั้ง แต่คราวนี้เจาะจงว่าการแบ่งคำใหม่ต้องไม่ทำพัง"""
+    assert spell.fix(text)[0] == text
+
+
+@needs_pythainlp
+def test_a_correction_never_removes_a_tone_mark(spell) -> None:
+    """`skeleton()` มองข้ามมาร์กทั้งหมด การ "ลบ" มาร์กทิ้งจึงผ่านด่านนั้นได้เสมอ
+
+    ของจริงที่เจอ: "เพือน" ถูกแก้เป็น "เพอน" (คำจริง ความถี่ผ่านเกณฑ์) แทนที่จะ
+    เป็น "เพื่อน" — คำผิดที่ ASR ทำคือมาร์กหายหรือสลับ ไม่เคยมีมาร์กเกินมา
+    """
+    from vc.thaispell import marks
+
+    for before in ("เพือน", "เปน", "ชือ"):
+        after = spell.fix(before)[0]
+        assert marks(after) >= marks(before), f"{before} → {after} มาร์กหายไป"
+
+
+# ───────────────────────────── 8. แก้คำผิดบนสตรีมโดยไม่ตัดกลางคำ (StreamSpell)
+@needs_pythainlp
+def test_a_streamed_reply_is_corrected_without_cutting_words(spell) -> None:
+    text = "อากาศวันนีเปนอยางไรบ้างครับ ผมอยากรู้ว่าพรุ่งนีฝนจะตกไหม"
+    stream = StreamSpell(spell)
+    out = "".join(stream.feed(text[i:i + 5]) for i in range(0, len(text), 5))
+    out += stream.flush()
+    assert out == "อากาศวันนี้เป็นอย่างไรบ้างครับ ผมอยากรู้ว่าพรุ่งนี้ฝนจะตกไหม"
+
+
+@needs_pythainlp
+def test_a_stream_gives_back_everything_it_was_given(spell) -> None:
+    """ห้ามกลืนข้อความหาย — ยาวเท่าไหร่ก็ต้องออกมาครบ (โครงพยัญชนะเท่าเดิม)"""
+    text = "สวัสดีครับ ผมพร้อมคุยแล้ว พูดแทรกได้ตลอดเวลา ถามอะไรก็ได้เลยครับ"
+    for size in (1, 3, 7, 40):
+        stream = StreamSpell(spell)
+        out = "".join(stream.feed(text[i:i + size])
+                      for i in range(0, len(text), size)) + stream.flush()
+        assert out == text
+
+
+def test_a_stream_passes_text_through_when_the_corrector_is_off() -> None:
+    stream = StreamSpell(ThaiSpell(enabled=False))
+    assert stream.feed("เปนอยางไร") == "เปนอยางไร"
+    assert stream.flush() == ""

@@ -10,16 +10,19 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from dataclasses import replace
 
 import pytest
 
 from vc.api import ApiError
-from vc.greeting import (GREETINGS_FEMALE, GREETINGS_MALE, MAX_CHARS, RECENT_MAX,
-                         GreetingWriter, clean, greeting_text)
+from vc.greeting import (ATTEMPTS, GREETINGS_FEMALE, GREETINGS_MALE, MAX_CHARS,
+                         RECENT_MAX, GreetingWriter, clean, greeting_text)
 
 pytestmark = pytest.mark.unit
+
+WINDOWS = sys.platform.startswith("win")
 
 # เพศของเสียงมาจากไฟล์อ้างอิงที่โคลนอยู่ ซึ่งไม่ใช่ประเด็นของเทสต์กลุ่มนี้
 FALLBACKS = GREETINGS_MALE + GREETINGS_FEMALE
@@ -139,9 +142,9 @@ def test_a_repeated_answer_is_retried_before_it_is_accepted(llm_cfg) -> None:
     """ลองใหม่ก่อน แต่ถ้ายังซ้ำก็ยอมใช้ของโมเดล — รายการสำรองมีแค่สี่แบบ ซ้ำหนักกว่า"""
     api = FakeApi("อันเดิมครับ")
     GreetingWriter(llm_cfg, api).make()
-    again = FakeApi("อันเดิมครับ", "อันเดิมครับ")
+    again = FakeApi(*["อันเดิมครับ"] * ATTEMPTS)
     assert GreetingWriter(llm_cfg, again).make() == "อันเดิมครับ"
-    assert len(again.prompts) == 2, "ได้ของซ้ำมาแล้วไม่ได้ลองใหม่เลย"
+    assert len(again.prompts) == ATTEMPTS, "ได้ของซ้ำมาแล้วไม่ได้ลองใหม่เลย"
 
 
 def test_almost_the_same_greeting_counts_as_repeated(llm_cfg) -> None:
@@ -154,9 +157,19 @@ def test_almost_the_same_greeting_counts_as_repeated(llm_cfg) -> None:
     assert GreetingWriter(llm_cfg, again).make() == "สวัสดีตอนเช้าครับ พูดแทรกได้เลย"
 
 
+# ต่างกันจริงทุกอัน — ถ้าใช้ "คำทักทายที่ 1/2/3" ตัวตรวจซ้ำแบบคล้ายกัน (SIMILAR)
+# จะตัดสินว่าซ้ำกันหมด แล้วเทสต์นี้จะวัดเรื่องอื่นแทนเพดานความจำ
+SEVENTEEN = ("สวัสดี", "หวัดดี", "ดีจ้า", "ยินดีต้อนรับ", "อรุณสวัสดิ์",
+             "ราตรีสวัสดิ์", "เฮลโหล", "มาแล้วนะ", "พร้อมแล้ว", "เริ่มกันเลย",
+             "ว่าไง", "ทักทายจ้า", "สบายดีไหม", "คิดถึงจัง", "มีอะไรให้ช่วย",
+             "ถามมาได้เลย", "โย่")
+
+
 def test_the_memory_never_grows_past_its_cap(llm_cfg) -> None:
-    api = FakeApi(*[f"คำทักทายที่ {i} ครับ" for i in range(RECENT_MAX + 5)])
-    for _ in range(RECENT_MAX + 5):
+    rounds = RECENT_MAX + 5
+    assert len(SEVENTEEN) >= rounds
+    api = FakeApi(*SEVENTEEN[:rounds])
+    for _ in range(rounds):
         GreetingWriter(llm_cfg, api).make()
     assert len(GreetingWriter(llm_cfg, api).recent()) == RECENT_MAX
 
@@ -169,6 +182,7 @@ def test_a_corrupt_memory_file_is_treated_as_empty(llm_cfg) -> None:
     assert writer.make() == "สวัสดีครับ"        # ยังทำงานต่อได้ตามปกติ
 
 
+@pytest.mark.skipif(WINDOWS, reason="สิทธิ์แบบ POSIX ใช้ไม่ได้บน Windows")
 def test_the_memory_file_is_private(llm_cfg) -> None:
     writer = GreetingWriter(llm_cfg, FakeApi("สวัสดีครับ"))
     writer.make()
