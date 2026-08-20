@@ -70,6 +70,8 @@ STREAM_KEEP = 2       # กันก้อนท้ายไว้กี่ก�
 # ค่าปรับของการ "แก้หนึ่งคำ" ในหน่วย log ความถี่ — การแบ่งที่ต้องแก้คำจะชนะการแบ่ง
 # ที่ไม่ต้องแก้ ก็ต่อเมื่อผลลัพธ์เป็นคำที่พบบ่อยกว่ากันราว e^6 ≈ 400 เท่า
 FIX_PENALTY = 6.0
+# การแก้ที่ทำให้ "มาร์กหายไป" ต้องพบบ่อยกว่าเกณฑ์ปกติกี่เท่าจึงจะยอม (ดู `_word`)
+LOSSY_FREQ_MULT = 10
 # ค่าปรับต่อ "หนึ่งชิ้น" — เอนไปทางคำยาวไม่กี่คำ แทนที่จะแตกเป็นเศษสั้น ๆ หลายชิ้น
 PIECE_PENALTY = 2.0
 # ค่าปรับเพิ่มของชิ้นที่สั้นกว่า `min_len` — เศษสองตัวอักษรที่พจนานุกรมรับรองว่า
@@ -351,16 +353,25 @@ class ThaiSpell:
             return cached
         best = word
         shape = skeleton(word)
-        # โครงพยัญชนะเท่าเดิม **และมาร์กต้องไม่ลดลง** — ด่านหลังมาจากของจริง:
+        # โครงพยัญชนะต้องเท่าเดิมเสมอ ส่วนมาร์กเป็นเรื่องของ *ลำดับความชอบ*:
         # skeleton() มองข้ามวรรณยุกต์/สระบน-ล่างทั้งหมด การ "ลบ" มาร์กทิ้งจึงผ่าน
-        # ด่านแรกเสมอ แล้ว "เพือน" ถูกแก้เป็น "เพอน" (ความถี่พอผ่านเกณฑ์ด้วย)
-        # แทนที่จะเป็น "เพื่อน" · คำผิดที่ ASR ทำคือมาร์ก *หาย* หรือสลับ ไม่ใช่มาร์กเกิน
+        # ด่านโครงเสมอ แล้ว "เพือน" ถูกแก้เป็น "เพอน" (ความถี่ผ่านเกณฑ์ด้วย)
+        # แทนที่จะเป็น "เพื่อน" · จึงเลือกจากกลุ่มที่มาร์กไม่ลดก่อนเสมอ
+        #
+        # แต่ห้ามเป็นด่านตายตัว: ASR ทำมาร์กหาย ส่วน *โมเดล* ใส่มาร์กเกินมา
+        # ("ครั้บ" ที่ควรเป็น "ครับ") ซึ่งไม่มีคำที่มาร์กเท่าเดิมให้เลือกเลย
+        # กลุ่มที่มาร์กลดจึงยังใช้ได้ แค่ต้องพบบ่อยกว่ากันมากจริง ๆ
         need = marks(word)
-        candidates = [c for c in eng.checker.known(eng.edits1(word))
-                      if skeleton(c) == shape and marks(c) >= need]
-        if candidates:
-            top = max(candidates, key=eng.checker.freq)
+        pool = [c for c in eng.checker.known(eng.edits1(word))
+                if skeleton(c) == shape]
+        keeps = [c for c in pool if marks(c) >= need]
+        if keeps:
+            top = max(keeps, key=eng.checker.freq)
             if eng.checker.freq(top) >= self.min_freq:
+                best = top
+        elif pool:
+            top = max(pool, key=eng.checker.freq)
+            if eng.checker.freq(top) >= self.min_freq * LOSSY_FREQ_MULT:
                 best = top
         if len(self._cache) >= CACHE_MAX:
             self._cache.clear()

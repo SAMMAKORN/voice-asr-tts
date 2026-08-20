@@ -203,7 +203,10 @@ web/           FastAPI app; WebSession(vc.chat.VoiceChat) + browser-side audio a
   may not *lose* combining marks (`marks()`), because `skeleton()` ignores them entirely,
   so deleting one always passes the skeleton check — that is how "เพือน" got "corrected"
   to "เพอน" (a real word, frequency above the floor) instead of "เพื่อน". ASR drops marks,
-  it does not add them.
+  it does not add them — but the *model* does, so this is a preference and not a rule:
+  when no same-mark candidate exists at all ("ครั้บ" for "ครับ"), a mark-losing one is
+  still allowed at `LOSSY_FREQ_MULT` times the usual frequency floor. As a hard rule it
+  silently locked out that entire class.
   Per-word correction alone barely fired, because the tokenizer stumbles on the typo and
   swallows the next word's first letter ("อากาศเปนอยางไร" → "อากาศ|เปนอ|ยาง|ไร"): the
   fragment is not a word and nothing has its consonant skeleton, so the whole sentence
