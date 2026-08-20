@@ -400,3 +400,74 @@ def test_a_stream_passes_text_through_when_the_corrector_is_off() -> None:
     stream = StreamSpell(ThaiSpell(enabled=False))
     assert stream.feed("เปนอยางไร") == "เปนอยางไร"
     assert stream.flush() == ""
+
+
+# ───────── 9. ซ่อมวลีที่ prompt ป้อนให้โมเดลไปเอง — บนสตรีม ไม่ใช่หลังจบเทิร์น
+# โมเดลคัดคำอ่านเวลาจาก system prompt มาผิดเป็นประจำ ("ห้าทุ่ม" → "ห้าวโมง")
+# ตัวแก้คำผิดช่วยไม่ได้เพราะผลลัพธ์เป็นคำไทยจริง แต่ที่นี่เรารู้ต้นฉบับอยู่แล้ว
+CLOCK = "ห้าทุ่มห้าสิบแปดนาที"
+PHRASES = (CLOCK, "วันพฤหัสบดี", "สิงหาคม")
+
+# ขนาดก้อนต้องไม่มีผลกับผลลัพธ์เลย — SSE แบ่ง delta ตรงไหนก็ได้
+CHUNKS = (1, 3, 7, 13, 25, 200)
+
+
+def _streamed(spell, text, phrases=PHRASES, size=7):
+    stream = StreamSpell(spell, phrases)
+    out = "".join(stream.feed(text[i:i + size]) for i in range(0, len(text), size))
+    return out + stream.flush()
+
+
+@needs_pythainlp
+@pytest.mark.parametrize("size", CHUNKS)
+def test_a_garbled_phrase_is_restored_mid_stream(spell, size) -> None:
+    bad = "ตอนนี้ห้าวโมงห้าสิบแปดนาทีแล้วครับ วันพฤหัสดีที่ 20 สิงหาคม ครับ"
+    good = "ตอนนี้ห้าทุ่มห้าสิบแปดนาทีแล้วครับ วันพฤหัสบดีที่ 20 สิงหาคม ครับ"
+    assert _streamed(spell, bad, size=size) == good
+
+
+@needs_pythainlp
+@pytest.mark.parametrize("size", CHUNKS)
+@pytest.mark.parametrize("text", [
+    "ตอนนี้ห้าทุ่มห้าสิบแปดนาทีแล้วครับ วันพฤหัสบดีที่ 20 สิงหาคม ครับ",
+    "ข้อดีของการนอนหลับมีสามข้อ คือ ร่างกายซ่อมแซมเซลล์ สมองจัดเก็บความจำ",
+    # พูดถึงเวลา/วันอื่นที่ไม่ใช่ของตอนนี้ ห้ามถูกดึงมาเป็นเวลาปัจจุบัน
+    "นัดประชุมพรุ่งนี้บ่ายสองโมงนะครับ ส่วนวันเสาร์ผมว่าง",
+])
+def test_restoring_on_a_stream_leaves_everything_else_alone(spell, text, size) -> None:
+    assert _streamed(spell, text, size=size) == text
+
+
+@needs_pythainlp
+def test_a_phrase_split_across_two_releases_is_not_duplicated(spell) -> None:
+    """เคยพังตรงนี้: "วัน" ถูกปล่อยไปก่อน แล้ว "พฤหัสบดี" ที่ตามมาดูเหมือนของคัดผิด
+    เลยถูกเติมเป็น "วันพฤหัสบดี" ได้ "วันวันพฤหัสบดี" — จุดตัดต้องกันช่วงนี้ไว้
+    """
+    text = "วันนี้เป็นวันพฤหัสบดีที่อากาศดีมากเลยนะครับ ผมชอบวันแบบนี้จริง ๆ"
+    for size in CHUNKS:
+        assert _streamed(spell, text, size=size) == text
+
+
+def test_a_stream_without_phrases_or_corrector_is_a_pass_through() -> None:
+    stream = StreamSpell(ThaiSpell(enabled=False), ())
+    assert not stream.enabled
+    assert stream.feed("เปนอยางไร") == "เปนอยางไร"
+
+
+@needs_pythainlp
+def test_phrases_work_even_when_the_word_corrector_is_off(spell) -> None:
+    """ซ่อมวลีที่เราป้อนเองไม่ใช่การเดา จึงไม่ควรผูกกับสวิตช์ของตัวแก้คำผิด"""
+    off = StreamSpell(ThaiSpell(enabled=False), (CLOCK,))
+    assert off.enabled
+    text = "ตอนนี้ห้าวโมงห้าสิบแปดนาทีแล้วครับ ขอบคุณครับ"
+    out = "".join(off.feed(text[i:i + 7]) for i in range(0, len(text), 7)) + off.flush()
+    assert CLOCK in out
+
+
+@needs_pythainlp
+def test_a_partial_phrase_is_never_padded_out_to_the_whole_thing(spell) -> None:
+    """"สิงห" คือ "สิงหาคม" ที่ยังพิมพ์ไม่จบ ไม่ใช่ของคัดผิด — เติมแล้วได้คำเกิน"""
+    from vc.thaispell import restore
+
+    assert restore("เดือนสิงห", "สิงหาคม") == "เดือนสิงห"
+    assert restore("พฤหัสบดี", "วันพฤหัสบดี") == "พฤหัสบดี"

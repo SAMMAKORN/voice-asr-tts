@@ -443,7 +443,22 @@ class Config:
             return changed
         return False
 
-    def system_message(self) -> dict:
+    def supplied_phrases(self, at: datetime) -> tuple[str, ...]:
+        """คำไทยที่ *เรา* ยื่นให้โมเดลใน system prompt ของเทิร์นนี้
+
+        โมเดลมีหน้าที่คัดกลับมาให้ตรง ไม่ใช่แต่งเอง แต่มันคัดผิดเป็นประจำ
+        ("ห้าทุ่ม" → "ห้าวโมง", "วันพฤหัสบดี" → "วันพฤหัสดี") · ตัวแก้คำผิดช่วย
+        ไม่ได้เพราะคำที่ได้มักเป็นคำไทยจริง แต่ที่นี่ไม่ต้องเดา เรารู้ต้นฉบับอยู่แล้ว
+        (`thaispell.restore()`)
+
+        ต้องรับ `at` เข้ามา ไม่ใช่เรียก `now()` เอง — รายการนี้กับ system prompt
+        ต้องมาจากนาทีเดียวกันเป๊ะ ไม่งั้นพอข้ามนาที ตัวซ่อมจะดึงเวลาที่โมเดล
+        เขียนถูกแล้วให้ย้อนกลับไปเป็นนาทีก่อนหน้า
+        """
+        return (thai_clock(at), THAI_DAYS[at.weekday()],
+                THAI_MONTHS[at.month - 1])
+
+    def system_message(self, at: datetime | None = None) -> dict:
         """ประกอบ system prompt: กติกาเครื่องมือ → วันเวลาปัจจุบัน → บุคลิกที่ผู้ใช้ตั้ง
 
         ลำดับสำคัญมาก — ถ้าเอากติกาเครื่องมือไปต่อท้าย โมเดลจะมองข้ามแล้วเดาคำตอบเอง
@@ -453,7 +468,7 @@ class Config:
         # เพี้ยนไป 7 ชั่วโมง แล้วโมเดลตอบเรื่อง "ตอนนี้" ผิดวันไปเลย (P3-20)
         active_zone = zone(self.tz)
         active_name = active_zone.key
-        stamp_at = now(active_zone)
+        stamp_at = at if at is not None else now(active_zone)
         where = ("ตามเวลาประเทศไทย" if active_name == DEFAULT_TZ
                  else f"ตามเขตเวลา {active_name}")
         # ให้ทั้งเลขและคำอ่านไทย: เลขไว้คำนวณ คำอ่านไว้พูด — โมเดลที่ได้แต่เลข

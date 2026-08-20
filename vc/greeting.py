@@ -35,7 +35,7 @@ from .api import ApiError
 from .config import (THAI_DAYS, THAI_MONTHS, Config, persona_instruction,
                      thai_clock)
 from .logger import FILE_MODE, chmod_quiet, private_dir
-from .thaispell import normalize
+from .thaispell import normalize, restore
 
 log = logging.getLogger("voicechat.greeting")
 
@@ -52,6 +52,10 @@ GREETINGS_FEMALE = (
     "หวัดดีค่ะ พร้อมคุยแล้วค่ะ อยากถามอะไรพูดได้เลยค่ะ",
     "สวัสดีค่ะ วันนี้มีอะไรให้ช่วยไหมคะ พูดแทรกได้ตลอดเวลาเลย",
 )
+
+# วลีที่ prompt ของคำทักทายป้อนให้โมเดลไปเอง (คำอ่านเวลา/วัน/เดือน อยู่ใน
+# `Config.supplied_phrases()` เพราะ system prompt ของทุกเทิร์นก็ใช้ชุดเดียวกัน)
+RESTORE = ("พูดแทรก",)
 
 RECENT_FILE = "greetings.json"   # อยู่ใต้ LOG_DIR ไม่ใช่ในโฟลเดอร์ session
 RECENT_MAX = 12                  # จำย้อนหลังกี่อัน (ยาวพอจะไม่ซ้ำในหนึ่งวันทำงาน)
@@ -80,41 +84,6 @@ TONES = (
     "น้ำเสียงสดใสร่าเริง",
     "น้ำเสียงสุขุมหนักแน่น",
 )
-# วลีที่ "เรา" เป็นคนป้อนให้โมเดลไป มันจึงมีหน้าที่คัดลอกกลับมาให้ตรง ไม่ใช่แต่งเอง
-# โมเดลนี้คัดผิดเป็นประจำ ("พูดแทรก" → "พุดแทรก", "ห้าทุ่ม" → "ห้าทึ่") ซึ่งตัวแก้คำผิด
-# ช่วยไม่ได้เพราะ "พุด" เป็นคำไทยจริง · แต่ที่นี่ไม่ต้องเดา เรารู้อยู่แล้วว่าต้นฉบับคืออะไร
-RESTORE = ("พูดแทรก",)
-# ต่ำกว่านี้ถือว่าคนละวลี ไม่ใช่การคัดผิด — วัดจากของจริง: คัดผิดอยู่ที่ 0.86-0.93
-# ส่วนวลีอื่นในประโยคเดียวกันไม่เกิน 0.46
-RESTORE_MIN = 0.72
-
-
-def restore(text: str, phrase: str) -> str:
-    """คืนวลีที่เราป้อนให้โมเดล ให้กลับเป็นรูปที่สะกดถูก (ถ้ามันคัดมาเพี้ยน)
-
-    ไล่หน้าต่างความยาวใกล้เคียงกับ `phrase` ทั้งข้อความ แล้วแทนที่อันที่คล้ายที่สุด
-    ถ้าคล้ายพอ · ไม่ใช่การแก้คำผิดแบบเดา — ปลายทางคือสตริงที่เราส่งไปเองเป๊ะ ๆ
-    """
-    if not phrase or phrase in text:
-        return text
-    matcher = SequenceMatcher(None, "", phrase)
-    best = (0.0, -1, 0)
-    span = len(phrase)
-    for start in range(len(text)):
-        for size in range(max(2, span - 3), min(span + 4, len(text) - start) + 1):
-            matcher.set_seq1(text[start:start + size])
-            if matcher.real_quick_ratio() <= best[0]:
-                continue
-            if matcher.quick_ratio() <= best[0]:
-                continue
-            score = matcher.ratio()
-            if score > best[0]:
-                best = (score, start, size)
-    if best[0] < RESTORE_MIN:
-        return text
-    return text[:best[1]] + phrase + text[best[1] + best[2]:]
-
-
 # ร้อนกว่าค่าสนทนาปกติเล็กน้อย — คำทักทายไม่มีคำตอบถูก/ผิด มีแต่ซ้ำ/ไม่ซ้ำ
 # เคยตั้ง 1.0 แล้วได้ความหลากหลายมาแลกกับภาษาไทยพัง ("แล่ว", "ห้าทึ่", "ก้ได้",
 # "ห้าวทุ่ม" — จาก 5 ครั้งติดกัน) ตัวแก้คำผิดช่วยไม่ได้เพราะส่วนใหญ่เป็นคำจริง
@@ -246,10 +215,9 @@ class GreetingWriter:
             if sum(len(p) for p in parts) > MAX_CHARS * 3:
                 break
         text = clean("".join(parts))
-        # ซ่อมเฉพาะวลีที่เราป้อนไปเอง — คำอ่านเวลา ชื่อวัน และชื่อเดือน ล้วนอยู่ใน
-        # prompt เดียวกันนี้ทั้งหมด ("วันพฤหัสบดี" กลับมาเป็น "วันพฤหัสดี" ก็เจอมาแล้ว)
-        for phrase in (*RESTORE, thai_clock(at), THAI_DAYS[at.weekday()],
-                       THAI_MONTHS[at.month - 1]):
+        # ซ่อมเฉพาะวลีที่เราป้อนไปเอง — คำอ่านเวลา ชื่อวัน ชื่อเดือน ใช้ชุดเดียวกับ
+        # ที่ทุกเทิร์นใช้ ("วันพฤหัสบดี" กลับมาเป็น "วันพฤหัสดี" ก็เจอมาแล้ว)
+        for phrase in (*RESTORE, *self.cfg.supplied_phrases(at)):
             text = restore(text, phrase)
         return text
 

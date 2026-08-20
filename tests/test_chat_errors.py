@@ -82,3 +82,29 @@ def test_the_system_prompt_is_rebuilt_every_turn(web_session) -> None:
     assert head["role"] == "system"
     assert stale not in head["content"], "ยังใช้ system prompt ที่เก็บไว้ตอนเปิด session"
     assert web_session.cfg.now().strftime("%H:%M") in head["content"]
+
+
+# ──────────────── 4. ตัวแก้คำผิดฝั่งคำตอบต้องทิ้งร่องรอยไว้เหมือนฝั่ง ASR
+def test_what_the_reply_corrector_changed_is_logged(web_session) -> None:
+    """เคยเงียบสนิท — พอคำตอบออกมาแปลก ก็แยกไม่ออกว่าโมเดลเขียนมาแบบนั้นเองไหม"""
+    import json
+
+    from vc.thaispell import engine
+
+    if engine() is None:
+        pytest.skip("เครื่องนี้ไม่ได้ติดตั้ง PyThaiNLP")
+
+    clock = web_session.cfg.supplied_phrases(web_session.cfg.now())[0]
+
+    def stream(*a, **k):
+        yield f"ตอนนี้{clock[:-4]}เพี้ยนแล้วครับ"
+
+    web_session.api.chat_stream = stream
+    web_session.respond(1, threading.Event(), "กี่โมงแล้ว")
+
+    events = [json.loads(line) for line
+              in web_session.log.jsonl.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    fixes = [e for e in events if e["type"] == "spell_fix"]
+    assert all(e.get("side") in {"asr", "reply"} for e in fixes), (
+        "ไม่ได้บอกว่าเป็นการแก้ฝั่งไหน แยกไม่ออกเวลาไล่ log")

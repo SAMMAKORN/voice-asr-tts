@@ -540,7 +540,8 @@ class VoiceChat:
             return text
         fixed, changes = self.spell.fix(text)
         if changes:
-            self.log.event("spell_fix", epoch=epoch, count=len(changes),
+            self.log.event("spell_fix", epoch=epoch, side="asr",
+                           count=len(changes),
                            detail=", ".join(f"{a}→{b}" for a, b in changes))
         return fixed
 
@@ -584,6 +585,7 @@ class VoiceChat:
             growth=self.cfg.tts_chunk_growth,
             max_target=self.cfg.tts_max_chars,
         )
+        at = self.cfg.now()      # เวลาของเทิร์นนี้ ใช้ร่วมกันทั้ง prompt และตัวซ่อมวลี
         full = ""
         seq = 0
         first_token_ms: int | None = None
@@ -619,12 +621,16 @@ class VoiceChat:
         # เพดานความยาวคำตอบ บังคับในโค้ด ไม่พึ่ง system prompt อย่างเดียว (P2-15)
         limiter = ReplyLimiter(self.cfg.reply_max_sentences, self.cfg.reply_max_chars)
         stream = self.api.chat_stream(
-            self._history(), cancel, tools=use_tools,
+            self._history(at), cancel, tools=use_tools,
             run_tool=run_tool if self.tools is not None else None,
             max_rounds=self.cfg.tool_rounds)
 
         # แก้คำผิดของคำตอบตั้งแต่ก่อนขึ้นจอ — จอ ประวัติ transcript และเสียงจึงตรงกัน
-        speller = StreamSpell(self.spell) if self.cfg.chat_spellcheck else None
+        # `supplied_phrases(at)` ต้องมาจาก `at` ตัวเดียวกับที่ประกอบ system prompt
+        # ไม่งั้นพอข้ามนาที ตัวซ่อมจะดึงเวลาที่โมเดลเขียนถูกให้ย้อนไปนาทีก่อนหน้า
+        speller = StreamSpell(self.spell if self.cfg.chat_spellcheck
+                              else ThaiSpell(enabled=False),
+                              self.cfg.supplied_phrases(at))
 
         def emit(text: str) -> None:
             """ส่งข้อความที่ผ่านเพดานแล้วออกทั้งจอและคิวเสียง"""
@@ -654,7 +660,7 @@ class VoiceChat:
             nonlocal first_token_ms
             if text and first_token_ms is None:
                 first_token_ms = int((time.perf_counter() - t0) * 1000)
-            emit(speller.feed(text) if speller is not None else text)
+            emit(speller.feed(text))
 
         try:
             for delta in stream:
@@ -674,7 +680,7 @@ class VoiceChat:
             else:
                 push(limiter.flush())      # สตรีมจบเอง — ปล่อยส่วนที่ค้างในเพดานออก
             # ถูกพูดแทรก = ทิ้งของที่ค้างในตัวแก้คำ ผู้ใช้ไม่ได้ยินท่อนนั้นอยู่แล้ว
-            if speller is not None and not cancel.is_set():
+            if not cancel.is_set():
                 emit(speller.flush())
             if not cancel.is_set():
                 if self.cfg.tts_single_request:
@@ -755,6 +761,11 @@ class VoiceChat:
             self.messages.append(message)
             self._last_reply = {"idx": len(self.messages) - 1,
                                 "message": message, "full": answer}
+        if speller.changes:
+            self.log.event("spell_fix", epoch=epoch, side="reply",
+                           count=len(speller.changes),
+                           detail=", ".join(f"{a}→{b}"
+                                            for a, b in speller.changes)[:500])
         self.log.turn(
             "assistant", full.strip() or "(ไม่มีข้อความ)",
             epoch=epoch, interrupted=interrupted,
@@ -783,7 +794,7 @@ class VoiceChat:
         self.console.write(text)
         self.console.end()
 
-    def _history(self) -> list[dict]:
+    def _history(self, at: object = None) -> list[dict]:
         """system prompt + ผลค้นเว็บที่จำไว้ + บทสนทนาช่วงท้าย
 
         ผลค้นเว็บใส่เป็น role=user ที่ห่อด้วย delimiter ของเนื้อหาภายนอก
@@ -795,7 +806,7 @@ class VoiceChat:
         # ประกอบ system prompt ใหม่ทุกเทิร์น ไม่ใช้ตัวที่เก็บไว้ตอนเปิด session:
         # ในนั้นมีวันเวลาปัจจุบันฝังอยู่ (P3-20) เซสชันที่เปิดค้างข้ามคืนจะบอกโมเดล
         # ว่าตอนนี้คือเวลาที่เปิดหน้าเว็บ แล้วคำตอบเรื่อง "ตอนนี้กี่โมง" ผิดทั้งวัน
-        head = [self.cfg.system_message()]
+        head = [self.cfg.system_message(at)]
         tail = self.messages[1:][-keep:] if keep else self.messages[1:]
         if not self.findings:
             return head + tail
