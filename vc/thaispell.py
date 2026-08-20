@@ -80,6 +80,8 @@ SHORT_PENALTY = 8.0
 _lock = threading.Lock()
 _engine: _Engine | None = None
 _failed = False
+# None = ยังไม่ได้ลอง · False = ไม่มี PyThaiNLP บนเครื่อง · อื่น ๆ = ฟังก์ชันจริง
+_normalizer: object = None
 
 
 class _Engine:
@@ -148,6 +150,36 @@ def engine() -> _Engine | None:
                 log.warning("ปิดการแก้คำผิดภาษาไทย: ใช้ PyThaiNLP ไม่ได้ (%s) — "
                             "ติดตั้งด้วย pip install pythainlp", exc)
     return _engine
+
+
+def normalize(text: str) -> str:
+    """รวมสระ/วรรณยุกต์ที่ซ้ำหรือสลับลำดับให้เป็นรูปมาตรฐาน — ไม่ใช่การ "แก้คำ"
+
+    ระดับ Unicode ล้วน ไม่มีการเดาคำจากพจนานุกรมเลย: วรรณยุกต์ซ้อนสองตัว
+    ("สดชื่่น") ถูกยุบเหลือตัวเดียว และ เ สองตัวติดกัน ("เเม่") กลายเป็น แ ตัวเดียว
+    ทั้งคู่คือรูปที่โมเดลพิมพ์ออกมาได้จริงและ TTS อ่านออกเสียงเพี้ยน
+
+    แยกออกมาเป็นฟังก์ชันของโมดูลนี้เพราะ `ThaiSpell.fix()` เรียกใช้อยู่แล้วภายใน
+    ส่วนคำทักทาย (`vc/greeting.py`) ไม่ได้ผ่านตัวแก้คำ — มันต้องการแค่ขั้นนี้
+    ซึ่งปลอดภัยพอจะใช้ได้โดยไม่ต้องมีสวิตช์เปิด/ปิด · ไม่มี PyThaiNLP = คืนของเดิม
+    """
+    global _normalizer
+    if not text or _normalizer is False:
+        return text
+    if _normalizer is None:
+        # import เฉพาะตัวที่ต้องใช้ ไม่ปลุก `_Engine` ทั้งก้อน — พจนานุกรมกับคลัง
+        # ชื่อคนหนัก ~0.4 วินาที ส่วนขั้นนี้ไม่ได้ใช้มันเลย เครื่องที่ปิดตัวแก้คำผิด
+        # ไว้ทั้งหมดจึงต้องไม่จ่ายค่านั้นเพราะคำทักทายบรรทัดเดียว
+        try:
+            from pythainlp.util import normalize as _fn
+        except Exception:             # noqa: BLE001 — ไม่มี PyThaiNLP บนเครื่อง
+            _normalizer = False
+            return text
+        _normalizer = _fn
+    try:
+        return _normalizer(text)
+    except Exception:                 # noqa: BLE001 — ห้ามล้มเพราะเรื่องนี้
+        return text
 
 
 def skeleton(word: str) -> str:

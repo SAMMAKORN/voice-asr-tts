@@ -18,7 +18,9 @@ import pytest
 
 from vc.api import ApiError
 from vc.greeting import (ATTEMPTS, GREETINGS_FEMALE, GREETINGS_MALE, MAX_CHARS,
-                         RECENT_MAX, GreetingWriter, clean, greeting_text)
+                         RECENT_MAX, GreetingWriter, clean, greeting_text,
+                         restore)
+from vc.thaispell import normalize
 
 pytestmark = pytest.mark.unit
 
@@ -163,6 +165,51 @@ SEVENTEEN = ("สวัสดี", "หวัดดี", "ดีจ้า", "ย
              "ราตรีสวัสดิ์", "เฮลโหล", "มาแล้วนะ", "พร้อมแล้ว", "เริ่มกันเลย",
              "ว่าไง", "ทักทายจ้า", "สบายดีไหม", "คิดถึงจัง", "มีอะไรให้ช่วย",
              "ถามมาได้เลย", "โย่")
+
+
+# ─────────────────────── รูปอักขระที่โมเดลพิมพ์เพี้ยน (ระดับ Unicode ไม่ใช่การเดาคำ)
+@pytest.mark.skipif(normalize("เเม่") == "เเม่",
+                    reason="เครื่องนี้ไม่ได้ติดตั้ง PyThaiNLP")
+@pytest.mark.parametrize("raw,said", [
+    ("ผมสดชื่่นมากเลยนะครับ", "ผมสดชื่นมากเลยนะครับ"),   # วรรณยุกต์ซ้อนสองตัว
+    ("ตอนนี้ห้าทุ่่มแล้วครับ", "ตอนนี้ห้าทุ่มแล้วครับ"),
+    ("เเม่ครับ", "แม่ครับ"),                              # เ สองตัวแทน แ
+])
+def test_a_greeting_with_a_doubled_tone_mark_is_tidied(raw, said) -> None:
+    """โมเดลพิมพ์แบบนี้ออกมาจริง แล้ว TTS อ่านเพี้ยน — คำทักทายไม่ได้ผ่านตัวแก้คำ"""
+    assert clean(raw) == said
+
+
+def test_correct_thai_survives_the_tidy_up_untouched() -> None:
+    for text in FALLBACKS:
+        assert clean(text) == text
+
+
+# ─────────── วลีที่เราป้อนไปเอง โมเดลต้องคัดกลับมาให้ตรง ไม่ตรงก็ซ่อมได้ไม่ต้องเดา
+# โมเดลคัดผิดเป็นประจำ ("พูดแทรก" → "พุดแทรก") ตัวแก้คำผิดช่วยไม่ได้เพราะ "พุด"
+# เป็นดอกไม้จริง ๆ ในพจนานุกรม แต่ที่นี่เรารู้ต้นฉบับอยู่แล้ว
+@pytest.mark.parametrize("garbled,phrase,fixed", [
+    ("ยินดีที่ได้คุยกันนะ พุดแทรกจังหวะไหนก็ได้",
+     "พูดแทรก", "ยินดีที่ได้คุยกันนะ พูดแทรกจังหวะไหนก็ได้"),
+    ("ดึกแล้วนะครับ ห้าทึ่ห้าสิบเอ็ดนาที ผมพร้อมคุย",
+     "ห้าทุ่มห้าสิบเอ็ดนาที", "ดึกแล้วนะครับ ห้าทุ่มห้าสิบเอ็ดนาที ผมพร้อมคุย"),
+])
+def test_a_phrase_we_supplied_is_restored_when_the_model_garbles_it(
+        garbled, phrase, fixed) -> None:
+    assert restore(garbled, phrase) == fixed
+
+
+@pytest.mark.parametrize("text,phrase", [
+    ("สวัสดีครับ ผมพร้อมคุยเลย พูดแทรกขัดจังหวะได้", "พูดแทรก"),   # ถูกอยู่แล้ว
+    ("สวัสดีค่ะ อยากคุยเรื่องอะไรก็บอกได้เลยนะคะ", "พูดแทรก"),     # ไม่มีวลีนี้เลย
+    ("สวัสดีครับ ผมพร้อมคุยเลย", "ห้าทุ่มห้าสิบเอ็ดนาที"),          # ไม่ได้พูดถึงเวลา
+])
+def test_restoring_leaves_everything_else_alone(text, phrase) -> None:
+    assert restore(text, phrase) == text
+
+
+def test_restoring_an_empty_phrase_is_a_no_op() -> None:
+    assert restore("สวัสดีครับ", "") == "สวัสดีครับ"
 
 
 def test_the_memory_never_grows_past_its_cap(llm_cfg) -> None:
