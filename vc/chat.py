@@ -19,7 +19,7 @@ from typing import Callable
 
 import numpy as np
 
-from .api import ApiClient, ApiError
+from .api import ApiClient, ApiError, explain
 from .audio import Microphone, Speaker, mac_input_volume
 from .chunker import ReplyLimiter, SentenceChunker, clean_for_tts, split_for_tts
 from .config import Config
@@ -28,9 +28,9 @@ from .greeting import GREETINGS_MALE, GreetingWriter
 from .logger import SessionLogger
 from .options import RuntimeOptions
 from .phase import BARGE_IN_PHASES, TurnPhase
-from .thaispell import ThaiSpell
+from .thaispell import StreamSpell, ThaiSpell
 from .tools import TOOLS, ToolRunner, describe, wrap_external
-from .ui import Console, CYAN, GREEN, MAGENTA, YELLOW
+from .ui import Console, CYAN, GREEN, MAGENTA, RED, YELLOW
 from .vad import VoiceGate
 
 # ตัวข้อความทักทายย้ายไป vc/greeting.py แล้ว (ตอนนี้มาจาก LLM ใหม่ทุกครั้งที่เริ่มระบบ)
@@ -623,13 +623,15 @@ class VoiceChat:
             run_tool=run_tool if self.tools is not None else None,
             max_rounds=self.cfg.tool_rounds)
 
+        # แก้คำผิดของคำตอบตั้งแต่ก่อนขึ้นจอ — จอ ประวัติ transcript และเสียงจึงตรงกัน
+        speller = StreamSpell(self.spell) if self.cfg.chat_spellcheck else None
+
         def emit(text: str) -> None:
             """ส่งข้อความที่ผ่านเพดานแล้วออกทั้งจอและคิวเสียง"""
-            nonlocal full, seq, started, first_token_ms
+            nonlocal full, seq, started
             if not text:
                 return
             if not started:
-                first_token_ms = int((time.perf_counter() - t0) * 1000)
                 self.console.begin("🤖 AI ", GREEN, role="assistant")
                 started = True
             full += text
@@ -642,12 +644,24 @@ class VoiceChat:
                     seq += 1
                     self.enqueue_tts(epoch, seq, chunk)
 
+        def push(text: str) -> None:
+            """ทางเข้าเดียวของข้อความจากโมเดล — ผ่านตัวแก้คำก่อนถึง `emit()`
+
+            จับเวลา "token แรก" ที่นี่ ไม่ใช่ใน `emit()` เพราะตัวแก้คำกันข้อความ
+            ท้ายไว้รอคำที่ยังพิมพ์ไม่จบ ถ้าไปจับตอนปล่อยผ่าน สถิติจะกลายเป็นเวลา
+            ของตัวแก้คำแทนที่จะเป็นเวลาที่โมเดลเริ่มตอบจริง
+            """
+            nonlocal first_token_ms
+            if text and first_token_ms is None:
+                first_token_ms = int((time.perf_counter() - t0) * 1000)
+            emit(speller.feed(text) if speller is not None else text)
+
         try:
             for delta in stream:
                 if cancel.is_set():
                     break
                 passed, capped = limiter.feed(delta)
-                emit(passed)
+                push(passed)
                 if capped:
                     # ปิดสตรีมให้สะอาด (ไม่ทิ้ง connection ค้าง ไม่มี chunk หลุดต่อ)
                     stream.close()
@@ -658,7 +672,10 @@ class VoiceChat:
                                    max_sentences=self.cfg.reply_max_sentences)
                     break
             else:
-                emit(limiter.flush())      # สตรีมจบเอง — ปล่อยส่วนที่ค้างในเพดานออก
+                push(limiter.flush())      # สตรีมจบเอง — ปล่อยส่วนที่ค้างในเพดานออก
+            # ถูกพูดแทรก = ทิ้งของที่ค้างในตัวแก้คำ ผู้ใช้ไม่ได้ยินท่อนนั้นอยู่แล้ว
+            if speller is not None and not cancel.is_set():
+                emit(speller.flush())
             if not cancel.is_set():
                 if self.cfg.tts_single_request:
                     if full.strip() and self.cfg.tts_enabled:
@@ -684,6 +701,7 @@ class VoiceChat:
             self.console.clear_status()
             self.console.error(f"เรียกโมเดลไม่สำเร็จ: {error}")
             self.log.event("chat_error", epoch=epoch, error=error)
+            self._show_failure(explain(error))
             return
 
         # รอให้พูดจบ (หรือถูกขัด / ถูกสั่งปิด / เกินเพดานเวลา)
@@ -751,6 +769,20 @@ class VoiceChat:
         tags = self.speaker.finished_tags[mark:]
         return "".join(t[2] for t in tags if isinstance(t, tuple) and t[0] == epoch)
 
+    def _show_failure(self, text: str) -> None:
+        """แจ้งความล้มเหลวในช่องบทสนทนาเอง ไม่ใช่แค่ในแผงบันทึก
+
+        `console.error()` ลงแต่แผงบันทึกระบบ ผู้ใช้จึงเห็นคำถามของตัวเองแล้วเงียบ
+        แยกไม่ออกว่าระบบพังหรือ AI เลือกจะไม่ตอบ (เจอจริงตอน CHAT_MODEL ใน .env
+        ชี้ไปโมเดลที่ไม่มีสิทธิ์เรียก: ทุกเทิร์นได้ 403 แต่หน้าจอว่างเปล่าสนิท)
+
+        ใช้ role=system ไม่ใช่ assistant — ข้อความนี้ไม่ได้ถูกพูดออกเสียง ไม่ถูก
+        เก็บลง `self.messages` และต้องหน้าตาต่างจากคำตอบจริงของ AI
+        """
+        self.console.begin("⚠️ ระบบ", RED, role="system")
+        self.console.write(text)
+        self.console.end()
+
     def _history(self) -> list[dict]:
         """system prompt + ผลค้นเว็บที่จำไว้ + บทสนทนาช่วงท้าย
 
@@ -760,7 +792,10 @@ class VoiceChat:
         ประวัติอาจตัดจนเหลือ tool ที่ไม่มี tool_calls คู่กัน แล้ว API ปฏิเสธทั้งคำขอ
         """
         keep = self.cfg.history_turns * 2
-        head = self.messages[:1]
+        # ประกอบ system prompt ใหม่ทุกเทิร์น ไม่ใช้ตัวที่เก็บไว้ตอนเปิด session:
+        # ในนั้นมีวันเวลาปัจจุบันฝังอยู่ (P3-20) เซสชันที่เปิดค้างข้ามคืนจะบอกโมเดล
+        # ว่าตอนนี้คือเวลาที่เปิดหน้าเว็บ แล้วคำตอบเรื่อง "ตอนนี้กี่โมง" ผิดทั้งวัน
+        head = [self.cfg.system_message()]
         tail = self.messages[1:][-keep:] if keep else self.messages[1:]
         if not self.findings:
             return head + tail

@@ -179,7 +179,8 @@ def test_every_numeric_key_in_env_example_has_a_range() -> None:
                if re.fullmatch(r"-?\d+(\.\d+)?", v)}
     skip = {"LOG_TRANSCRIPT", "ECHO_GUARD", "TTS_SINGLE_REQUEST",
             "TTS_SEARCH_FILLER", "TTS_READ_NUMBERS", "TTS_REF_NORMALIZE",
-            "ASR_SPELLCHECK", "TTS_SPELLCHECK", "GREET_FROM_LLM",
+            "ASR_SPELLCHECK", "TTS_SPELLCHECK", "CHAT_SPELLCHECK",
+                "GREET_FROM_LLM",
             "WEB_SEARCH", "WEB_TRUST_PROXY"}                         # ค่าเปิด/ปิด
     declared = set(RANGES) | set(WEB_RANGES)
     missing = sorted(k for k in numeric if k not in declared and k not in skip)

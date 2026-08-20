@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from vc.config import DEFAULT_TZ, Config, now, zone
+from vc.config import DEFAULT_TZ, Config, now, thai_clock, zone
 from vc.logger import SessionLogger
 
 pytestmark = pytest.mark.unit
@@ -193,3 +193,37 @@ def test_windows_declares_the_timezone_database_dependency() -> None:
         r"(?mi)^tzdata[^\n;]*;[^\n]*sys_platform\s*==\s*[\"']win32[\"']",
         requirements,
     ), "Windows ไม่มี IANA timezone database จึงต้องติดตั้ง tzdata โดยตรง"
+
+
+# ─────────────────────────── เวลาที่ยื่นให้โมเดลต้องเป็นคำที่คนไทยพูดจริง
+# ส่งแค่ "เวลา 22:39 น." แล้วให้โมเดลแปลงเอง ได้ "22 โมงกว่าๆ" ซึ่งไม่มีใครพูด
+# และมันถูกอ่านออกเสียงใส่หูผู้ใช้ตรง ๆ
+@pytest.mark.parametrize("hour,minute,said", [
+    (0, 0, "เที่ยงคืน"),
+    (1, 0, "ตีหนึ่ง"),
+    (5, 30, "ตีห้าครึ่ง"),
+    (6, 0, "หกโมงเช้า"),
+    (11, 0, "สิบเอ็ดโมงเช้า"),
+    (12, 0, "เที่ยงวัน"),
+    (13, 0, "บ่ายโมง"),
+    (15, 0, "บ่ายสามโมง"),
+    (16, 0, "สี่โมงเย็น"),
+    (18, 0, "หกโมงเย็น"),
+    (19, 0, "หนึ่งทุ่ม"),
+    (22, 39, "สี่ทุ่มสามสิบเก้านาที"),
+    (23, 59, "ห้าทุ่มห้าสิบเก้านาที"),
+])
+def test_the_clock_is_read_the_way_thai_speakers_say_it(hour, minute, said) -> None:
+    assert thai_clock(datetime(2026, 8, 20, hour, minute)) == said
+
+
+def test_no_hour_is_ever_read_as_a_number_of_moong() -> None:
+    """ภาษาไทยไม่มี "โมง" เกินสิบเอ็ด — ทุกชั่วโมงต้องมีคำเรียกของตัวเอง"""
+    for hour in range(24):
+        said = thai_clock(datetime(2026, 8, 20, hour, 0))
+        assert said and not any(ch.isdigit() for ch in said)
+
+
+def test_the_system_prompt_hands_the_model_the_thai_words(cfg) -> None:
+    content = cfg.system_message()["content"]
+    assert thai_clock(cfg.now()) in content, "โมเดลต้องได้คำอ่าน ไม่ใช่แค่ตัวเลข"
