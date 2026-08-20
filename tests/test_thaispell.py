@@ -362,17 +362,31 @@ def test_resegmenting_never_touches_correct_thai(spell, text) -> None:
 
 
 @needs_pythainlp
-def test_a_correction_never_removes_a_tone_mark(spell) -> None:
+def test_a_correction_prefers_not_to_remove_a_tone_mark(spell) -> None:
     """`skeleton()` มองข้ามมาร์กทั้งหมด การ "ลบ" มาร์กทิ้งจึงผ่านด่านนั้นได้เสมอ
 
     ของจริงที่เจอ: "เพือน" ถูกแก้เป็น "เพอน" (คำจริง ความถี่ผ่านเกณฑ์) แทนที่จะ
-    เป็น "เพื่อน" — คำผิดที่ ASR ทำคือมาร์กหายหรือสลับ ไม่เคยมีมาร์กเกินมา
+    เป็น "เพื่อน" — คำผิดที่ ASR ทำคือมาร์กหายหรือสลับ
     """
     from vc.thaispell import marks
 
     for before in ("เพือน", "เปน", "ชือ"):
         after = spell.fix(before)[0]
         assert marks(after) >= marks(before), f"{before} → {after} มาร์กหายไป"
+
+
+@needs_pythainlp
+@pytest.mark.parametrize("before,after", [
+    ("ขอบคุณครั้บ", "ขอบคุณครับ"),
+    ("สวัสดีครั้บ", "สวัสดีครับ"),
+])
+def test_an_extra_tone_mark_is_still_removable(spell, before, after) -> None:
+    """ด่านข้างบนต้องเป็น "ลำดับความชอบ" ไม่ใช่กฎตายตัว
+
+    ASR ทำมาร์กหาย แต่ *โมเดล* ใส่มาร์กเกินมา ("ครั้บ") ซึ่งไม่มีคำที่มาร์กเท่าเดิม
+    ให้เลือกเลย ถ้าห้ามขาดก็แก้ไม่ได้ทั้งคลาส — ยอมได้ แต่ต้องพบบ่อยกว่ากันมาก
+    """
+    assert spell.fix(before)[0] == after
 
 
 # ───────────────────────────── 8. แก้คำผิดบนสตรีมโดยไม่ตัดกลางคำ (StreamSpell)
